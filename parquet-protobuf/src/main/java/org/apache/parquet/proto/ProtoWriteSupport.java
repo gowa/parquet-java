@@ -46,7 +46,6 @@ import com.twitter.elephantbird.util.Protobufs;
 import java.lang.reflect.Array;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -246,13 +245,17 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
      * Used for writing nonrepeated (optional, required) fields
      */
     void writeField(Object value) {
-      if (!(this instanceof ProtoWriteSupport.MapWriter)) {
-        recordConsumer.startField(fieldName, index);
-      }
+      writeBeforeAll();
       writeRawValue(value);
-      if (!(this instanceof ProtoWriteSupport.MapWriter)) {
-        recordConsumer.endField(fieldName, index);
-      }
+      writeAfterAll();
+    }
+
+    void writeBeforeAll() {
+      recordConsumer.startField(fieldName, index);
+    }
+
+    void writeAfterAll() {
+      recordConsumer.endField(fieldName, index);
     }
   }
 
@@ -270,11 +273,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         Type type = schema.getType(name);
         FieldWriter writer = createWriter(fieldDescriptor, type);
 
-        if (writeSpecsCompliant && fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
+        if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
           writer = new ArrayWriter(writer);
-        } else if (!writeSpecsCompliant && fieldDescriptor.isRepeated()) {
-          // the old schemas style used to write maps as repeated fields instead of wrapping them in a LIST
-          writer = new RepeatedWriter(writer);
         }
 
         writer.setFieldName(name);
@@ -311,7 +311,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private FieldWriter createMessageWriter(FieldDescriptor fieldDescriptor, Type type) {
-      if (fieldDescriptor.isMapField() && writeSpecsCompliant) {
+      if (fieldDescriptor.isMapField()) {
         return createMapWriter(fieldDescriptor, type);
       }
 
@@ -409,7 +409,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       // ValueFieldWriter
       FieldDescriptor valueProtoField = fields.get(1);
-      FieldWriter valueWriter = createWriter(valueProtoField, type);
+      FieldWriter valueWriter = createWriter(
+          valueProtoField,
+          writeSpecsCompliant ? type : type.asGroupType().getType("value"));
       valueWriter.setFieldName(valueProtoField.getName());
       valueWriter.setIndex(1);
 
@@ -431,16 +433,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       recordConsumer.startGroup();
       writeAllFields((MessageOrBuilder) value);
       recordConsumer.endGroup();
-    }
-
-    /**
-     * Used for writing nonrepeated (optional, required) fields
-     */
-    @Override
-    final void writeField(Object value) {
-      recordConsumer.startField(fieldName, index);
-      writeRawValue(value);
-      recordConsumer.endField(fieldName, index);
     }
 
     private void writeAllFields(MessageOrBuilder pb) {
@@ -487,7 +479,41 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
-  class ArrayWriter extends FieldWriter {
+  class RepeatedFieldWriter extends FieldWriter {
+
+    @Override
+    final void writeRawValue(Object value) {
+      writeBeforeElement();
+      writeElement(value);
+      writeAfterElement();
+    }
+
+    @Override
+    final void writeField(Object value) {
+      List<?> list = (List<?>) value;
+      if (list.isEmpty()) {
+        return;
+      }
+
+      writeBeforeAll();
+      for (Object element : list) {
+        writeRawValue(element);
+      }
+      writeAfterAll();
+    }
+
+    void writeBeforeAll() {}
+
+    void writeAfterAll() {}
+
+    void writeBeforeElement() {}
+
+    void writeAfterElement() {}
+
+    void writeElement(Object element) {}
+  }
+
+  class ArrayWriter extends RepeatedFieldWriter {
     final FieldWriter fieldWriter;
 
     ArrayWriter(FieldWriter fieldWriter) {
@@ -495,67 +521,44 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     @Override
-    final void writeRawValue(Object value) {
-      throw new UnsupportedOperationException("Array has no raw value");
+    final void writeBeforeAll() {
+      recordConsumer.startField(fieldName, index);
+      if (writeSpecsCompliant) {
+        recordConsumer.startGroup();
+
+        recordConsumer.startField("list", 0); // This is the wrapper group for the array field
+      }
     }
 
     @Override
-    final void writeField(Object value) {
-      List<?> list = (List<?>) value;
-      if (list.isEmpty()) {
-        return;
+    final void writeAfterAll() {
+      if (writeSpecsCompliant) {
+        recordConsumer.endField("list", 0);
+
+        recordConsumer.endGroup();
       }
+      recordConsumer.endField(fieldName, index);
+    }
 
-      recordConsumer.startField(fieldName, index);
-      recordConsumer.startGroup();
-
-      recordConsumer.startField("list", 0); // This is the wrapper group for the array field
-      for (Object listEntry : list) {
+    @Override
+    final void writeBeforeElement() {
+      if (writeSpecsCompliant) {
         recordConsumer.startGroup();
         recordConsumer.startField("element", 0); // This is the mandatory inner field
+      }
+    }
 
-        fieldWriter.writeRawValue(listEntry);
-
+    @Override
+    final void writeAfterElement() {
+      if (writeSpecsCompliant) {
         recordConsumer.endField("element", 0);
         recordConsumer.endGroup();
       }
-      recordConsumer.endField("list", 0);
-
-      recordConsumer.endGroup();
-      recordConsumer.endField(fieldName, index);
-    }
-  }
-
-  /**
-   * The RepeatedWriter is used to write collections (lists and maps) using the old style (without LIST and MAP
-   * wrappers).
-   */
-  class RepeatedWriter extends FieldWriter {
-    final FieldWriter fieldWriter;
-
-    RepeatedWriter(FieldWriter fieldWriter) {
-      this.fieldWriter = fieldWriter;
     }
 
     @Override
-    final void writeRawValue(Object value) {
-      throw new UnsupportedOperationException("Array has no raw value");
-    }
-
-    @Override
-    final void writeField(Object value) {
-      List<?> list = (List<?>) value;
-      if (list.isEmpty()) {
-        return;
-      }
-
-      recordConsumer.startField(fieldName, index);
-
-      for (Object listEntry : list) {
-        fieldWriter.writeRawValue(listEntry);
-      }
-
-      recordConsumer.endField(fieldName, index);
+    final void writeElement(Object element) {
+      fieldWriter.writeRawValue(element);
     }
   }
 
@@ -599,7 +602,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
-  class MapWriter extends FieldWriter {
+  class MapWriter extends RepeatedFieldWriter {
 
     private final FieldWriter keyWriter;
     private final FieldWriter valueWriter;
@@ -611,32 +614,44 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     @Override
-    final void writeRawValue(Object value) {
-      Collection<Message> collection = (Collection<Message>) value;
-      if (collection.isEmpty()) {
-        return;
-      }
+    final void writeBeforeAll() {
       recordConsumer.startField(fieldName, index);
-      recordConsumer.startGroup();
-
-      recordConsumer.startField("key_value", 0); // This is the wrapper group for the map field
-      for (Message msg : collection) {
+      if (writeSpecsCompliant) {
         recordConsumer.startGroup();
 
-        final Descriptor descriptorForType = msg.getDescriptorForType();
-        final FieldDescriptor keyDesc = descriptorForType.findFieldByName("key");
-        final FieldDescriptor valueDesc = descriptorForType.findFieldByName("value");
+        recordConsumer.startField("key_value", 0); // This is the wrapper group for the map field
+      }
+    }
 
-        keyWriter.writeField(msg.getField(keyDesc));
-        valueWriter.writeField(msg.getField(valueDesc));
+    @Override
+    final void writeAfterAll() {
+      if (writeSpecsCompliant) {
+        recordConsumer.endField("key_value", 0);
 
         recordConsumer.endGroup();
       }
-
-      recordConsumer.endField("key_value", 0);
-
-      recordConsumer.endGroup();
       recordConsumer.endField(fieldName, index);
+    }
+
+    @Override
+    final void writeBeforeElement() {
+      recordConsumer.startGroup();
+    }
+
+    @Override
+    final void writeAfterElement() {
+      recordConsumer.endGroup();
+    }
+
+    @Override
+    final void writeElement(Object element) {
+      Message msg = (Message) element;
+      final Descriptor descriptorForType = msg.getDescriptorForType();
+      final FieldDescriptor keyDesc = descriptorForType.findFieldByName("key");
+      final FieldDescriptor valueDesc = descriptorForType.findFieldByName("value");
+
+      keyWriter.writeField(msg.getField(keyDesc));
+      valueWriter.writeField(msg.getField(valueDesc));
     }
   }
 
