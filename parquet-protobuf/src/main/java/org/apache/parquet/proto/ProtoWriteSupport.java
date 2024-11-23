@@ -1133,8 +1133,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       } else if (fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE) {
         if (fieldDescriptor.isRepeated()) {
           try {
-            Method getter =
-                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder", int.class);
+            Method getter = objectClass.getMethod(
+                "get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder", int.class);
             Class<?> elementClass = getter.getReturnType(); // element
             verifyMessageOrBuilderInterface(elementClass);
             return (Class<? extends MessageOrBuilder>) elementClass;
