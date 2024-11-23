@@ -91,8 +91,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   public static final String PB_UNWRAP_PROTO_WRAPPERS = "parquet.proto.unwrapProtoWrappers";
 
+  public static final String PB_USE_JAVA_REFLECTION = "parquet.proto.useJavaReflection";
+
   private boolean writeSpecsCompliant = false;
   private boolean unwrapProtoWrappers = false;
+  private boolean useJavaReflection = false;
   private RecordConsumer recordConsumer;
   private Class<? extends Message> protoMessage;
   private Descriptor descriptor;
@@ -133,6 +136,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   public static void setUnwrapProtoWrappers(Configuration configuration, boolean unwrapProtoWrappers) {
     configuration.setBoolean(PB_UNWRAP_PROTO_WRAPPERS, unwrapProtoWrappers);
+  }
+
+  public static void setUseJavaReflection(Configuration configuration, boolean useJavaReflection) {
+    configuration.setBoolean(PB_USE_JAVA_REFLECTION, useJavaReflection);
   }
 
   /**
@@ -188,12 +195,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     unwrapProtoWrappers = configuration.getBoolean(PB_UNWRAP_PROTO_WRAPPERS, unwrapProtoWrappers);
     writeSpecsCompliant = configuration.getBoolean(PB_SPECS_COMPLIANT_WRITE, writeSpecsCompliant);
+    useJavaReflection = configuration.getBoolean(PB_USE_JAVA_REFLECTION, useJavaReflection);
     MessageType rootSchema = new ProtoSchemaConverter(configuration).convert(descriptor);
     validatedMapping(descriptor, rootSchema);
 
-    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage != null
-        ? ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(protoMessage)
-        : null;
+    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage == null || !useJavaReflection
+        ? null
+        : ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(protoMessage);
 
     this.messageWriter = new MessageWriter(descriptor, rootSchema, messageOrBuilderInterface);
 
