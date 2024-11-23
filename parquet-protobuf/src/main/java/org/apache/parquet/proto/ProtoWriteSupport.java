@@ -31,10 +31,12 @@ import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.DoubleValue;
 import com.google.protobuf.FloatValue;
+import com.google.protobuf.GeneratedMessageV3;
 import com.google.protobuf.Int32Value;
 import com.google.protobuf.Int64Value;
 import com.google.protobuf.Message;
 import com.google.protobuf.MessageOrBuilder;
+import com.google.protobuf.ProtocolMessageEnum;
 import com.google.protobuf.StringValue;
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.UInt32Value;
@@ -43,15 +45,20 @@ import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
 import com.twitter.elephantbird.util.Protobufs;
+import java.lang.invoke.LambdaMetafactory;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
+import java.lang.reflect.Method;
+import java.lang.reflect.ParameterizedType;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.util.Collection;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.function.Consumer;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -184,7 +191,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     MessageType rootSchema = new ProtoSchemaConverter(configuration).convert(descriptor);
     validatedMapping(descriptor, rootSchema);
 
-    this.messageWriter = new MessageWriter(descriptor, rootSchema);
+    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage != null
+        ? ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(protoMessage)
+        : null;
+
+    this.messageWriter = new MessageWriter(descriptor, rootSchema, messageOrBuilderInterface);
 
     extraMetaData.put(ProtoReadSupport.PB_DESCRIPTOR, descriptor.toProto().toString());
     extraMetaData.put(PB_SPECS_COMPLIANT_WRITE, String.valueOf(writeSpecsCompliant));
@@ -223,9 +234,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     return enumMetadata;
   }
 
+  abstract class FieldOfObjectWriter {
+    abstract void setFieldWriter(FieldWriter fieldWriter);
+
+    abstract void writeFieldOfObject(Object object);
+  }
+
   class FieldWriter {
     String fieldName;
     int index = -1;
+    FieldOfObjectWriter fieldOfObjectWriter;
 
     void setFieldName(String fieldName) {
       this.fieldName = fieldName;
@@ -259,24 +277,88 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     void writeAfterAll() {
       recordConsumer.endField(fieldName, index);
     }
+
+    void createFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) {
+      try {
+        switch (fieldDescriptor.getJavaType()) {
+          case INT:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new IntListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new IntFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case LONG:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new LongListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new LongFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case FLOAT:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new FloatListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new FloatFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case DOUBLE:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new DoubleListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new DoubleFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case BOOLEAN:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new BooleanListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new BooleanFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case STRING:
+          case BYTE_STRING:
+          case ENUM:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new ObjectListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new ObjectFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case MESSAGE:
+            if (fieldDescriptor.isMapField()) {
+              fieldOfObjectWriter = new MapFieldOfObjectWriter(fieldDescriptor, objectClass);
+            } else {
+              fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                  ? new ObjectListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                  : new ObjectFieldOfObjectWriter(fieldDescriptor, objectClass);
+            }
+            break;
+        }
+        fieldOfObjectWriter.setFieldWriter(this);
+      } catch (Throwable t) {
+        throw new RuntimeException("was not able to initialize field-of-object writer", t);
+      }
+    }
+
+    FieldOfObjectWriter getFieldOfObjectWriter() {
+      return fieldOfObjectWriter;
+    }
   }
 
   class MessageWriter extends FieldWriter {
 
     final FieldWriter[] fieldWriters;
+    final Class<?> messageOrBuilderInterface;
 
     @SuppressWarnings("unchecked")
-    MessageWriter(Descriptor descriptor, GroupType schema) {
+    MessageWriter(
+        Descriptor descriptor, GroupType schema, Class<? extends MessageOrBuilder> messageOrBuilderInterface) {
       List<FieldDescriptor> fields = descriptor.getFields();
       fieldWriters = (FieldWriter[]) Array.newInstance(FieldWriter.class, fields.size());
+
+      ProtobufJavaReflectionUtil.verifyMessageOrBuilderInterface(messageOrBuilderInterface);
+      this.messageOrBuilderInterface = messageOrBuilderInterface;
 
       for (FieldDescriptor fieldDescriptor : fields) {
         String name = fieldDescriptor.getName();
         Type type = schema.getType(name);
-        FieldWriter writer = createWriter(fieldDescriptor, type);
+        FieldWriter writer = createWriter(fieldDescriptor, type, messageOrBuilderInterface);
 
         if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
           writer = new ArrayWriter(writer);
+        }
+
+        if (messageOrBuilderInterface != null) {
+          writer.createFieldOfObjectWriter(fieldDescriptor, messageOrBuilderInterface);
         }
 
         writer.setFieldName(name);
@@ -286,13 +368,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
     }
 
-    private FieldWriter createWriter(FieldDescriptor fieldDescriptor, Type type) {
+    private FieldWriter createWriter(FieldDescriptor fieldDescriptor, Type type, Class<?> objectClass) {
 
       switch (fieldDescriptor.getJavaType()) {
         case STRING:
           return new StringWriter();
         case MESSAGE:
-          return createMessageWriter(fieldDescriptor, type);
+          return createMessageWriter(fieldDescriptor, type, objectClass);
         case INT:
           return new IntWriter();
         case LONG:
@@ -312,9 +394,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       return unknownType(fieldDescriptor); // should not be executed, always throws exception.
     }
 
-    private FieldWriter createMessageWriter(FieldDescriptor fieldDescriptor, Type type) {
+    private FieldWriter createMessageWriter(FieldDescriptor fieldDescriptor, Type type, Class<?> objectClass) {
       if (fieldDescriptor.isMapField()) {
-        return createMapWriter(fieldDescriptor, type);
+        return createMapWriter(
+            fieldDescriptor,
+            type,
+            ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
+                fieldDescriptor, objectClass));
       }
 
       if (unwrapProtoWrappers) {
@@ -363,7 +449,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         return new BinaryWriter();
       }
 
-      return new MessageWriter(fieldDescriptor.getMessageType(), getGroupType(type));
+      return new MessageWriter(
+          fieldDescriptor.getMessageType(),
+          getGroupType(type),
+          ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
+              fieldDescriptor, objectClass));
     }
 
     private GroupType getGroupType(Type type) {
@@ -396,22 +486,31 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .orElse(type.asGroupType());
     }
 
-    private MapWriter createMapWriter(FieldDescriptor fieldDescriptor, Type type) {
+    private MapWriter createMapWriter(
+        FieldDescriptor fieldDescriptor, Type type, Class<? extends MessageOrBuilder> objectClass) {
       List<FieldDescriptor> fields = fieldDescriptor.getMessageType().getFields();
       if (fields.size() != 2) {
         throw new UnsupportedOperationException(
             "Expected two fields for the map (key/value), but got: " + fields);
       }
 
+      Class<?> mapEntryClass = objectClass == null
+          ? null
+          : ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
+              fieldDescriptor, objectClass);
+
       // KeyFieldWriter
       FieldDescriptor keyProtoField = fields.get(0);
-      FieldWriter keyWriter = createWriter(keyProtoField, type);
+      FieldWriter keyWriter = createWriter(keyProtoField, type, mapEntryClass);
       keyWriter.setFieldName(keyProtoField.getName());
       keyWriter.setIndex(0);
 
       // ValueFieldWriter
       FieldDescriptor valueProtoField = fields.get(1);
-      FieldWriter valueWriter = createWriter(valueProtoField, writeSpecsCompliant ? type : type.asGroupType().getType("value"));
+      FieldWriter valueWriter = createWriter(
+          valueProtoField,
+          writeSpecsCompliant ? type : type.asGroupType().getType("value"),
+          mapEntryClass);
       valueWriter.setFieldName(valueProtoField.getName());
       valueWriter.setIndex(1);
 
@@ -446,6 +545,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private void writeAllFields(MessageOrBuilder pb) {
+      if (messageOrBuilderInterface != null && messageOrBuilderInterface.isInstance(pb)) {
+        for (FieldWriter fieldWriter : fieldWriters) {
+          fieldWriter.getFieldOfObjectWriter().writeFieldOfObject(pb);
+        }
+        return;
+      }
+
       Descriptor messageDescriptor = pb.getDescriptorForType();
       Descriptors.FileDescriptor.Syntax syntax =
           messageDescriptor.getFile().getSyntax();
@@ -513,9 +619,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     void writeBeforeAll() {}
+
     void writeAfterAll() {}
+
     void writeBeforeElement() {}
+
     void writeAfterElement() {}
+
     void writeElement(Object element) {}
   }
 
@@ -585,6 +695,511 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
+  interface FieldHasValue {
+    boolean hasValue(Object object);
+  }
+
+  interface GetRepeatedFieldSize {
+    int getSize(Object object);
+  }
+
+  interface ObjectValueGetter {
+    Object getValue(Object object);
+  }
+
+  interface IntValueGetter {
+    int getValue(Object object);
+  }
+
+  interface LongValueGetter {
+    long getValue(Object object);
+  }
+
+  interface DoubleValueGetter {
+    double getValue(Object object);
+  }
+
+  interface FloatValueGetter {
+    float getValue(Object object);
+  }
+
+  interface BooleanValueGetter {
+    boolean getValue(Object object);
+  }
+
+  interface ObjectListElementGetter {
+    Object getElement(Object object, int pos);
+  }
+
+  interface IntListElementGetter {
+    int getElement(Object object, int pos);
+  }
+
+  interface LongListElementGetter {
+    long getElement(Object object, int pos);
+  }
+
+  interface DoubleListElementGetter {
+    double getElement(Object object, int pos);
+  }
+
+  interface FloatListElementGetter {
+    float getElement(Object object, int pos);
+  }
+
+  interface BooleanListElementGetter {
+    boolean getElement(Object object, int pos);
+  }
+
+  static class ProtobufJavaReflectionUtil {
+
+    static Class<? extends MessageOrBuilder> getMessageOrBuilderInterfaceOrNull(Class<?> messageClass) {
+      return Stream.of(messageClass)
+          .filter(x -> x.isAssignableFrom(GeneratedMessageV3.class))
+          .flatMap(x -> Arrays.stream(x.getInterfaces()))
+          .filter(MessageOrBuilder.class::isAssignableFrom)
+          .map(x -> (Class<? extends MessageOrBuilder>) x)
+          .findFirst()
+          .orElse(null);
+    }
+
+    // almost the same as com.google.protobuf.Descriptors.FieldDescriptor#fieldNameToJsonName
+    // but capitalizing the first letter after each last digit
+    static String getFieldNameForMethod(FieldDescriptor fieldDescriptor) {
+      String name = fieldDescriptor.getName();
+      final int length = name.length();
+      StringBuilder result = new StringBuilder(length);
+      boolean isNextUpperCase = false;
+      for (int i = 0; i < length; i++) {
+        char ch = name.charAt(i);
+        if (ch == '_' || ('0' <= ch && ch <= '9')) {
+          isNextUpperCase = true;
+        } else if (isNextUpperCase) {
+          // This closely matches the logic for ASCII characters in:
+          // http://google3/google/protobuf/descriptor.cc?l=249-251&rcl=228891689
+          if ('a' <= ch && ch <= 'z') {
+            ch = (char) (ch - 'a' + 'A');
+          }
+          result.append(ch);
+          isNextUpperCase = false;
+        } else {
+          result.append(ch);
+        }
+      }
+      return result.toString();
+    }
+
+    static void verifyMessageOrBuilderInterface(Class<?> objectClass) {
+      if (objectClass == null) {
+        return;
+      }
+      if (!objectClass.isInterface() || !MessageOrBuilder.class.isAssignableFrom(objectClass)) {
+        throw new IllegalStateException(
+            "a sub-interface of MessageOrBuilder interface is expected, but got " + objectClass);
+      }
+    }
+
+    static FieldHasValue getHasValueOrNull(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      if (fieldDescriptor.isRepeated()) {
+        throw new IllegalStateException("not supported for repeated fields");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      if (!fieldDescriptor.hasPresence()) {
+        return null;
+      }
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (FieldHasValue) LambdaMetafactory.metafactory(
+              lookup,
+              "hasValue",
+              MethodType.methodType(FieldHasValue.class),
+              MethodType.methodType(boolean.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "has" + getFieldNameForMethod(fieldDescriptor),
+                  MethodType.methodType(boolean.class)),
+              MethodType.methodType(boolean.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static GetRepeatedFieldSize getRepeatedFieldSize(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated()) {
+        throw new IllegalStateException("not supported for non-repeated fields");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (GetRepeatedFieldSize) LambdaMetafactory.metafactory(
+              lookup,
+              "getSize",
+              MethodType.methodType(GetRepeatedFieldSize.class),
+              MethodType.methodType(int.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor) + "Count",
+                  MethodType.methodType(int.class)),
+              MethodType.methodType(int.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static ObjectValueGetter getGetObjectValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
+        throw new IllegalStateException("not supported for repeated fields");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      String mapOrBuilder = fieldDescriptor.isMapField()
+          ? "Map"
+          : fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE ? "OrBuilder" : "";
+      return (ObjectValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(ObjectValueGetter.class),
+              MethodType.methodType(Object.class, Object.class),
+              lookup.unreflect(objectClass.getMethod(
+                  "get" + getFieldNameForMethod(fieldDescriptor) + mapOrBuilder)),
+              MethodType.methodType(Object.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static IntValueGetter getGetIntValue(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      if (fieldDescriptor.isRepeated()
+          || !(fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.INT
+              || fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM)) {
+        throw new IllegalStateException("not supported for repeated fields or non-int or non-enums");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      String enumValueSuffix = fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM ? "Value" : "";
+      return (IntValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(IntValueGetter.class),
+              MethodType.methodType(int.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor) + enumValueSuffix,
+                  MethodType.methodType(int.class)),
+              MethodType.methodType(int.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static LongValueGetter getGetLongValue(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.LONG) {
+        throw new IllegalStateException("not supported for repeated fields or non-long");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (LongValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(LongValueGetter.class),
+              MethodType.methodType(long.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor),
+                  MethodType.methodType(long.class)),
+              MethodType.methodType(long.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static DoubleValueGetter getGetDoubleValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.DOUBLE) {
+        throw new IllegalStateException("not supported for repeated fields or non-double");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (DoubleValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(DoubleValueGetter.class),
+              MethodType.methodType(double.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor),
+                  MethodType.methodType(double.class)),
+              MethodType.methodType(double.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static FloatValueGetter getGetFloatValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.FLOAT) {
+        throw new IllegalStateException("not supported for repeated fields or non-float");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (FloatValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(FloatValueGetter.class),
+              MethodType.methodType(float.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor),
+                  MethodType.methodType(float.class)),
+              MethodType.methodType(float.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static BooleanValueGetter getGetBooleanValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.BOOLEAN) {
+        throw new IllegalStateException("not supported for repeated fields or non-boolean");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (BooleanValueGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getValue",
+              MethodType.methodType(BooleanValueGetter.class),
+              MethodType.methodType(boolean.class, Object.class),
+              lookup.findVirtual(
+                  objectClass,
+                  "get" + getFieldNameForMethod(fieldDescriptor),
+                  MethodType.methodType(boolean.class)),
+              MethodType.methodType(boolean.class, objectClass))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static ObjectListElementGetter getGetObjectListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated() || fieldDescriptor.isMapField()) {
+        throw new IllegalStateException("not supported for non-repeated fields or maps");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      String orBuilder =
+          !fieldDescriptor.isMapField() && fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE
+              ? "OrBuilder"
+              : "";
+      return (ObjectListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(ObjectListElementGetter.class),
+              MethodType.methodType(Object.class, Object.class, int.class),
+              lookup.unreflect(objectClass.getMethod(
+                  "get" + getFieldNameForMethod(fieldDescriptor) + orBuilder + "List")),
+              MethodType.methodType(Object.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static IntListElementGetter getGetIntListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated()
+          || !(fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.INT
+              || fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM)) {
+        throw new IllegalStateException("not supported for non-repeated fields or non-ints or non-enums");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      String enumValueSuffix = fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM ? "Value" : "";
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (IntListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(IntListElementGetter.class),
+              MethodType.methodType(int.class, Object.class, int.class),
+              lookup.unreflect(objectClass.getMethod(
+                  "get" + getFieldNameForMethod(fieldDescriptor) + enumValueSuffix + "List")),
+              MethodType.methodType(int.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static LongListElementGetter getGetLongListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.LONG) {
+        throw new IllegalStateException("not supported for non-repeated fields or non-longs");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (LongListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(LongListElementGetter.class),
+              MethodType.methodType(long.class, Object.class, int.class),
+              lookup.unreflect(
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+              MethodType.methodType(long.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static DoubleListElementGetter getGetDoubleListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.DOUBLE) {
+        throw new IllegalStateException("not supported for non-repeated fields or non-doubles");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (DoubleListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(DoubleListElementGetter.class),
+              MethodType.methodType(double.class, Object.class, int.class),
+              lookup.unreflect(
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+              MethodType.methodType(double.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static FloatListElementGetter getGetFloatListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.FLOAT) {
+        throw new IllegalStateException("not supported for non-repeated fields or non-floats");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (FloatListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(FloatListElementGetter.class),
+              MethodType.methodType(float.class, Object.class, int.class),
+              lookup.unreflect(
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+              MethodType.methodType(float.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static BooleanListElementGetter getGetBooleanListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
+        throws Throwable {
+      if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.BOOLEAN) {
+        throw new IllegalStateException("not supported for non-repeated fields or non-booleans");
+      }
+      verifyMessageOrBuilderInterface(objectClass);
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (BooleanListElementGetter) LambdaMetafactory.metafactory(
+              lookup,
+              "getElement",
+              MethodType.methodType(BooleanListElementGetter.class),
+              MethodType.methodType(boolean.class, Object.class, int.class),
+              lookup.unreflect(
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+              MethodType.methodType(boolean.class, objectClass, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
+    static Class<? extends MessageOrBuilder> extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
+        FieldDescriptor fieldDescriptor, Class<?> objectClass) {
+      if (objectClass == null) {
+        return null;
+      }
+      if (fieldDescriptor.isMapField()) {
+        try {
+          Method getter = objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "Map");
+          ParameterizedType mapKV = (ParameterizedType) getter.getGenericReturnType();
+          Class<?> valueClass = (Class<?>) mapKV.getActualTypeArguments()[1]; // value
+          return ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(valueClass);
+        } catch (NoSuchMethodException e) {
+          throw new UnsupportedOperationException(
+              "could not find a getter method for a map field: " + fieldDescriptor, e);
+        }
+      } else if (fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE) {
+        if (fieldDescriptor.isRepeated()) {
+          try {
+            Method getter =
+                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilderList");
+            ParameterizedType listT = (ParameterizedType) getter.getGenericReturnType();
+            Class<?> elementClass = (Class<?>) listT.getActualTypeArguments()[0]; // element
+            verifyMessageOrBuilderInterface(elementClass);
+            return (Class<? extends MessageOrBuilder>) elementClass;
+          } catch (NoSuchMethodException e) {
+            throw new UnsupportedOperationException(
+                "could not find a getter method for a repeated field: " + fieldDescriptor, e);
+          }
+        } else {
+          try {
+            Method getter =
+                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder");
+            Class<?> elementClass = getter.getReturnType();
+            verifyMessageOrBuilderInterface(elementClass);
+            return (Class<? extends MessageOrBuilder>) elementClass;
+          } catch (NoSuchMethodException e) {
+            throw new UnsupportedOperationException(
+                "could not find a getter method for a repeated field: " + fieldDescriptor, e);
+          }
+        }
+      } else {
+        return null;
+      }
+    }
+  }
+
+  class ObjectFieldOfObjectWriter extends FieldOfObjectWriter {
+    final ObjectValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    FieldWriter fieldWriter;
+
+    ObjectFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValue(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class ObjectListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final ObjectListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    FieldWriter elementWriter;
+
+    ObjectListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        Object value = getListElement.getElement(object, i);
+        elementWriter.writeRawValue(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
+    }
+  }
+
   class StringWriter extends FieldWriter {
     @Override
     final void writeRawValue(Object value) {
@@ -593,18 +1208,188 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
+  class IntFieldOfObjectWriter extends FieldOfObjectWriter {
+    final IntValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    IntWriter fieldWriter;
+
+    IntFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (IntWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValuePrimitive(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class IntListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final IntListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    IntWriter elementWriter;
+
+    IntListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (IntWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        int value = getListElement.getElement(object, i);
+        elementWriter.writeRawValuePrimitive(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
+    }
+  }
+
   class IntWriter extends FieldWriter {
+    final void writeRawValuePrimitive(int value) {
+      recordConsumer.addInteger(value);
+    }
+
     @Override
     final void writeRawValue(Object value) {
-      recordConsumer.addInteger((Integer) value);
+      writeRawValuePrimitive((int) value);
+    }
+  }
+
+  class LongFieldOfObjectWriter extends FieldOfObjectWriter {
+    final LongValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    LongWriter fieldWriter;
+
+    LongFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetLongValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (LongWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValuePrimitive(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class LongListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final LongListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    LongWriter elementWriter;
+
+    LongListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetLongListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (LongWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        long value = getListElement.getElement(object, i);
+        elementWriter.writeRawValuePrimitive(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
     }
   }
 
   class LongWriter extends FieldWriter {
 
+    final void writeRawValuePrimitive(long value) {
+      recordConsumer.addLong(value);
+    }
+
     @Override
     final void writeRawValue(Object value) {
-      recordConsumer.addLong((Long) value);
+      writeRawValuePrimitive((long) value);
+    }
+  }
+
+  class MapFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final ObjectValueGetter getMap;
+
+    MapWriter mapWriter;
+    FieldWriter keyWriter;
+    FieldWriter valueWriter;
+
+    MapFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getMap = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.mapWriter = (MapWriter) fieldWriter;
+      this.keyWriter = mapWriter.keyWriter;
+      this.valueWriter = mapWriter.valueWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      mapWriter.writeBeforeAll();
+      Map map = (Map) getMap.getValue(object);
+      map.forEach((k, v) -> {
+        mapWriter.writeBeforeElement();
+        keyWriter.writeField(k);
+        valueWriter.writeField(v);
+        mapWriter.writeAfterElement();
+      });
+      mapWriter.writeAfterAll();
     }
   }
 
@@ -661,17 +1446,243 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
+  class FloatFieldOfObjectWriter extends FieldOfObjectWriter {
+    final FloatValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    FloatWriter fieldWriter;
+
+    FloatFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetFloatValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (FloatWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValuePrimitive(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class FloatListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final FloatListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    FloatWriter elementWriter;
+
+    FloatListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetFloatListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (FloatWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        float value = getListElement.getElement(object, i);
+        elementWriter.writeRawValuePrimitive(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
+    }
+  }
+
   class FloatWriter extends FieldWriter {
+
+    final void writeRawValuePrimitive(float value) {
+      recordConsumer.addFloat(value);
+    }
+
     @Override
     final void writeRawValue(Object value) {
-      recordConsumer.addFloat((Float) value);
+      writeRawValuePrimitive((float) value);
+    }
+  }
+
+  class DoubleFieldOfObjectWriter extends FieldOfObjectWriter {
+    final DoubleValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    DoubleWriter fieldWriter;
+
+    DoubleFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetDoubleValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (DoubleWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValuePrimitive(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class DoubleListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final DoubleListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    DoubleWriter elementWriter;
+
+    DoubleListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetDoubleListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (DoubleWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        double value = getListElement.getElement(object, i);
+        elementWriter.writeRawValuePrimitive(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
     }
   }
 
   class DoubleWriter extends FieldWriter {
+    final void writeRawValuePrimitive(double value) {
+      recordConsumer.addDouble(value);
+    }
+
     @Override
     final void writeRawValue(Object value) {
-      recordConsumer.addDouble((Double) value);
+      writeRawValuePrimitive((double) value);
+    }
+  }
+
+  class EnumFieldOfObjectWriter extends FieldOfObjectWriter {
+    final ObjectValueGetter getEnum;
+    final IntValueGetter getEnumValue;
+    final FieldHasValue fieldHasValue;
+    final Descriptors.EnumDescriptor enumDescriptor;
+    final List<Descriptors.EnumValueDescriptor> enumValues;
+
+    EnumWriter fieldWriter;
+
+    EnumFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getEnum = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
+      this.getEnumValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, objectClass);
+      this.enumDescriptor = fieldDescriptor.getEnumType();
+      this.enumValues = enumDescriptor.getValues();
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (EnumWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+
+      ProtocolMessageEnum enum_ = (ProtocolMessageEnum) getEnum.getValue(object);
+      Enum<?> javaEnum = (Enum<?>) enum_;
+      Descriptors.EnumValueDescriptor enumValueDescriptor;
+      if (javaEnum.ordinal() < enumValues.size()) {
+        enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+      } else {
+        enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(getEnumValue.getValue(object));
+      }
+      fieldWriter.writeRawValue(enumValueDescriptor);
+
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class EnumListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final ObjectListElementGetter getEnumListElement;
+    final IntListElementGetter getEnumValueListElement;
+    final Descriptors.EnumDescriptor enumDescriptor;
+    final List<Descriptors.EnumValueDescriptor> enumValues;
+
+    ArrayWriter arrayWriter;
+    EnumWriter elementWriter;
+
+    EnumListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getEnumListElement = ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, objectClass);
+      this.getEnumValueListElement =
+          ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, objectClass);
+      this.enumDescriptor = fieldDescriptor.getEnumType();
+      this.enumValues = enumDescriptor.getValues();
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (EnumWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        ProtocolMessageEnum enum_ = (ProtocolMessageEnum) getEnumListElement.getElement(object, i);
+        Enum<?> javaEnum = (Enum<?>) enum_;
+        Descriptors.EnumValueDescriptor enumValueDescriptor;
+        if (javaEnum.ordinal() < enumValues.size()) {
+          enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+        } else {
+          enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(
+              getEnumValueListElement.getElement(object, i));
+        }
+        elementWriter.writeRawValue(enumValueDescriptor);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
     }
   }
 
@@ -696,10 +1707,77 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
+  class BooleanFieldOfObjectWriter extends FieldOfObjectWriter {
+    final BooleanValueGetter getValue;
+    final FieldHasValue fieldHasValue;
+
+    BooleanWriter fieldWriter;
+
+    BooleanFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetBooleanValue(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.fieldWriter = (BooleanWriter) fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      if (fieldHasValue != null && !fieldHasValue.hasValue(object)) {
+        return;
+      }
+      fieldWriter.writeBeforeAll();
+      fieldWriter.writeRawValuePrimitive(getValue.getValue(object));
+      fieldWriter.writeAfterAll();
+    }
+  }
+
+  class BooleanListFieldOfObjectWriter extends FieldOfObjectWriter {
+    final GetRepeatedFieldSize getRepeatedFieldSize;
+    final BooleanListElementGetter getListElement;
+
+    ArrayWriter arrayWriter;
+    BooleanWriter elementWriter;
+
+    BooleanListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetBooleanListElement(fieldDescriptor, objectClass);
+    }
+
+    @Override
+    void setFieldWriter(FieldWriter fieldWriter) {
+      this.arrayWriter = (ArrayWriter) fieldWriter;
+      this.elementWriter = (BooleanWriter) arrayWriter.fieldWriter;
+    }
+
+    @Override
+    void writeFieldOfObject(Object object) {
+      int size = getRepeatedFieldSize.getSize(object);
+      if (size == 0) {
+        return;
+      }
+      arrayWriter.writeBeforeAll();
+      for (int i = 0; i < size; i++) {
+        arrayWriter.writeBeforeElement();
+        boolean value = getListElement.getElement(object, i);
+        elementWriter.writeRawValuePrimitive(value);
+        arrayWriter.writeAfterElement();
+      }
+      arrayWriter.writeAfterAll();
+    }
+  }
+
   class BooleanWriter extends FieldWriter {
+
+    final void writeRawValuePrimitive(boolean value) {
+      recordConsumer.addBoolean(value);
+    }
+
     @Override
     final void writeRawValue(Object value) {
-      recordConsumer.addBoolean((Boolean) value);
+      writeRawValuePrimitive((boolean) value);
     }
   }
 
