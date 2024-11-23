@@ -95,7 +95,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   private boolean writeSpecsCompliant = false;
   private boolean unwrapProtoWrappers = false;
-  private boolean useJavaReflection = false;
+  private boolean useJavaReflection = true;
   private RecordConsumer recordConsumer;
   private Class<? extends Message> protoMessage;
   private Descriptor descriptor;
@@ -199,7 +199,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     MessageType rootSchema = new ProtoSchemaConverter(configuration).convert(descriptor);
     validatedMapping(descriptor, rootSchema);
 
-    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage == null || !useJavaReflection
+    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage == null
+            || !useJavaReflection
+            || descriptor.getFile().getSyntax() != Descriptors.FileDescriptor.Syntax.PROTO3
         ? null
         : ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(protoMessage);
 
@@ -316,10 +318,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             break;
           case STRING:
           case BYTE_STRING:
-          case ENUM:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
                 ? new ObjectListFieldOfObjectWriter(fieldDescriptor, objectClass)
                 : new ObjectFieldOfObjectWriter(fieldDescriptor, objectClass);
+            break;
+          case ENUM:
+            fieldOfObjectWriter = fieldDescriptor.isRepeated()
+                ? new EnumListFieldOfObjectWriter(fieldDescriptor, objectClass)
+                : new EnumFieldOfObjectWriter(fieldDescriptor, objectClass);
             break;
           case MESSAGE:
             if (fieldDescriptor.isMapField()) {
@@ -359,7 +365,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       for (FieldDescriptor fieldDescriptor : fields) {
         String name = fieldDescriptor.getName();
         Type type = schema.getType(name);
-        FieldWriter writer = createWriter(fieldDescriptor, type, messageOrBuilderInterface);
+        FieldWriter writer = createWriter(fieldDescriptor, type, messageOrBuilderInterface, null);
 
         if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
           writer = new ArrayWriter(writer);
@@ -376,13 +382,17 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
     }
 
-    private FieldWriter createWriter(FieldDescriptor fieldDescriptor, Type type, Class<?> objectClass) {
+    private FieldWriter createWriter(
+        FieldDescriptor fieldDescriptor,
+        Type type,
+        Class<?> objectClass,
+        Class<? extends MessageOrBuilder> associatedMessageClass) {
 
       switch (fieldDescriptor.getJavaType()) {
         case STRING:
           return new StringWriter();
         case MESSAGE:
-          return createMessageWriter(fieldDescriptor, type, objectClass);
+          return createMessageWriter(fieldDescriptor, type, objectClass, associatedMessageClass);
         case INT:
           return new IntWriter();
         case LONG:
@@ -402,7 +412,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       return unknownType(fieldDescriptor); // should not be executed, always throws exception.
     }
 
-    private FieldWriter createMessageWriter(FieldDescriptor fieldDescriptor, Type type, Class<?> objectClass) {
+    private FieldWriter createMessageWriter(
+        FieldDescriptor fieldDescriptor,
+        Type type,
+        Class<?> objectClass,
+        Class<? extends MessageOrBuilder> associatedMessageClass) {
       if (fieldDescriptor.isMapField()) {
         return createMapWriter(
             fieldDescriptor,
@@ -460,8 +474,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       return new MessageWriter(
           fieldDescriptor.getMessageType(),
           getGroupType(type),
-          ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
-              fieldDescriptor, objectClass));
+          associatedMessageClass != null
+              ? associatedMessageClass
+              : ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
+                  fieldDescriptor, objectClass));
     }
 
     private GroupType getGroupType(Type type) {
@@ -495,21 +511,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private MapWriter createMapWriter(
-        FieldDescriptor fieldDescriptor, Type type, Class<? extends MessageOrBuilder> objectClass) {
+        FieldDescriptor fieldDescriptor, Type type, Class<? extends MessageOrBuilder> valueMessageOrBuilder) {
       List<FieldDescriptor> fields = fieldDescriptor.getMessageType().getFields();
       if (fields.size() != 2) {
         throw new UnsupportedOperationException(
             "Expected two fields for the map (key/value), but got: " + fields);
       }
 
-      Class<?> mapEntryClass = objectClass == null
-          ? null
-          : ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
-              fieldDescriptor, objectClass);
-
       // KeyFieldWriter
       FieldDescriptor keyProtoField = fields.get(0);
-      FieldWriter keyWriter = createWriter(keyProtoField, type, mapEntryClass);
+      FieldWriter keyWriter = createWriter(keyProtoField, type, null, null);
       keyWriter.setFieldName(keyProtoField.getName());
       keyWriter.setIndex(0);
 
@@ -518,7 +529,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       FieldWriter valueWriter = createWriter(
           valueProtoField,
           writeSpecsCompliant ? type : type.asGroupType().getType("value"),
-          mapEntryClass);
+          null,
+          valueMessageOrBuilder);
       valueWriter.setFieldName(valueProtoField.getName());
       valueWriter.setIndex(1);
 
@@ -763,7 +775,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     static Class<? extends MessageOrBuilder> getMessageOrBuilderInterfaceOrNull(Class<?> messageClass) {
       return Stream.of(messageClass)
-          .filter(x -> x.isAssignableFrom(GeneratedMessageV3.class))
+          .filter(x -> GeneratedMessageV3.class.isAssignableFrom(x))
           .flatMap(x -> Arrays.stream(x.getInterfaces()))
           .filter(MessageOrBuilder.class::isAssignableFrom)
           .map(x -> (Class<? extends MessageOrBuilder>) x)
@@ -780,9 +792,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       boolean isNextUpperCase = false;
       for (int i = 0; i < length; i++) {
         char ch = name.charAt(i);
-        if (ch == '_' || ('0' <= ch && ch <= '9')) {
+        if (ch == '_') {
           isNextUpperCase = true;
-        } else if (isNextUpperCase) {
+        } else if ('0' <= ch && ch <= '9') {
+          isNextUpperCase = true;
+          result.append(ch);
+        } else if (isNextUpperCase || i == 0) {
           // This closely matches the logic for ASCII characters in:
           // http://google3/google/protobuf/descriptor.cc?l=249-251&rcl=228891689
           if ('a' <= ch && ch <= 'z') {
@@ -996,7 +1011,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(ObjectListElementGetter.class),
               MethodType.methodType(Object.class, Object.class, int.class),
               lookup.unreflect(objectClass.getMethod(
-                  "get" + getFieldNameForMethod(fieldDescriptor) + orBuilder + "List")),
+                  "get" + getFieldNameForMethod(fieldDescriptor) + orBuilder, int.class)),
               MethodType.methodType(Object.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1018,7 +1033,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(IntListElementGetter.class),
               MethodType.methodType(int.class, Object.class, int.class),
               lookup.unreflect(objectClass.getMethod(
-                  "get" + getFieldNameForMethod(fieldDescriptor) + enumValueSuffix + "List")),
+                  "get" + getFieldNameForMethod(fieldDescriptor) + enumValueSuffix, int.class)),
               MethodType.methodType(int.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1037,7 +1052,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(LongListElementGetter.class),
               MethodType.methodType(long.class, Object.class, int.class),
               lookup.unreflect(
-                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor), int.class)),
               MethodType.methodType(long.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1056,7 +1071,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(DoubleListElementGetter.class),
               MethodType.methodType(double.class, Object.class, int.class),
               lookup.unreflect(
-                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor), int.class)),
               MethodType.methodType(double.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1075,7 +1090,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(FloatListElementGetter.class),
               MethodType.methodType(float.class, Object.class, int.class),
               lookup.unreflect(
-                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor), int.class)),
               MethodType.methodType(float.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1094,7 +1109,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               MethodType.methodType(BooleanListElementGetter.class),
               MethodType.methodType(boolean.class, Object.class, int.class),
               lookup.unreflect(
-                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "List")),
+                  objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor), int.class)),
               MethodType.methodType(boolean.class, objectClass, int.class))
           .getTarget()
           .invokeExact();
@@ -1111,7 +1126,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           ParameterizedType mapKV = (ParameterizedType) getter.getGenericReturnType();
           Class<?> valueClass = (Class<?>) mapKV.getActualTypeArguments()[1]; // value
           return ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(valueClass);
-        } catch (NoSuchMethodException e) {
+        } catch (Exception e) {
           throw new UnsupportedOperationException(
               "could not find a getter method for a map field: " + fieldDescriptor, e);
         }
@@ -1119,12 +1134,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         if (fieldDescriptor.isRepeated()) {
           try {
             Method getter =
-                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilderList");
-            ParameterizedType listT = (ParameterizedType) getter.getGenericReturnType();
-            Class<?> elementClass = (Class<?>) listT.getActualTypeArguments()[0]; // element
+                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder", int.class);
+            Class<?> elementClass = getter.getReturnType(); // element
             verifyMessageOrBuilderInterface(elementClass);
             return (Class<? extends MessageOrBuilder>) elementClass;
-          } catch (NoSuchMethodException e) {
+          } catch (Exception e) {
             throw new UnsupportedOperationException(
                 "could not find a getter method for a repeated field: " + fieldDescriptor, e);
           }
@@ -1135,9 +1149,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             Class<?> elementClass = getter.getReturnType();
             verifyMessageOrBuilderInterface(elementClass);
             return (Class<? extends MessageOrBuilder>) elementClass;
-          } catch (NoSuchMethodException e) {
+          } catch (Exception e) {
             throw new UnsupportedOperationException(
-                "could not find a getter method for a repeated field: " + fieldDescriptor, e);
+                "could not find a getter method for a non-repeated field: " + fieldDescriptor, e);
           }
         }
       } else {
