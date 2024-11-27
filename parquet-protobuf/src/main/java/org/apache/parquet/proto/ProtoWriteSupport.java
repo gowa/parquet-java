@@ -554,16 +554,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       recordConsumer.endGroup();
     }
 
-    /**
-     * Used for writing nonrepeated (optional, required) fields
-     */
-    @Override
-    final void writeField(Object value) {
-      recordConsumer.startField(fieldName, index);
-      writeRawValue(value);
-      recordConsumer.endField(fieldName, index);
-    }
-
     private void writeAllFields(MessageOrBuilder pb) {
       if (messageOrBuilderInterface != null && messageOrBuilderInterface.isInstance(pb)) {
         for (FieldWriter fieldWriter : fieldWriters) {
