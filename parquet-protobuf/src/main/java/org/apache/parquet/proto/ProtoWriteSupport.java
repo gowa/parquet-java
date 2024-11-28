@@ -23,28 +23,14 @@ import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_ITEM_SEPARAT
 import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_KEY_VALUE_SEPARATOR;
 import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_PREFIX;
 
-import com.google.protobuf.BoolValue;
-import com.google.protobuf.ByteString;
-import com.google.protobuf.BytesValue;
-import com.google.protobuf.Descriptors;
+import com.google.protobuf.*;
 import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FieldDescriptor;
-import com.google.protobuf.DoubleValue;
-import com.google.protobuf.FloatValue;
-import com.google.protobuf.GeneratedMessageV3;
-import com.google.protobuf.Int32Value;
-import com.google.protobuf.Int64Value;
-import com.google.protobuf.Message;
-import com.google.protobuf.MessageOrBuilder;
-import com.google.protobuf.ProtocolMessageEnum;
-import com.google.protobuf.StringValue;
-import com.google.protobuf.Timestamp;
-import com.google.protobuf.UInt32Value;
-import com.google.protobuf.UInt64Value;
 import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
 import com.twitter.elephantbird.util.Protobufs;
+import java.lang.Enum;
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -53,11 +39,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
@@ -199,13 +181,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     MessageType rootSchema = new ProtoSchemaConverter(configuration).convert(descriptor);
     validatedMapping(descriptor, rootSchema);
 
-    Class<? extends MessageOrBuilder> messageOrBuilderInterface = protoMessage == null
-            || !useJavaReflection
-            || descriptor.getFile().getSyntax() != Descriptors.FileDescriptor.Syntax.PROTO3
-        ? null
-        : ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(protoMessage);
-
-    this.messageWriter = new MessageWriter(descriptor, rootSchema, messageOrBuilderInterface);
+    this.messageWriter = new MessageWriter(
+        descriptor, rootSchema, ProtobufJavaReflectionUtil.getProto3MessageClassOrNull(protoMessage));
 
     extraMetaData.put(ProtoReadSupport.PB_DESCRIPTOR, descriptor.toProto().toString());
     extraMetaData.put(PB_SPECS_COMPLIANT_WRITE, String.valueOf(writeSpecsCompliant));
@@ -288,52 +265,52 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       recordConsumer.endField(fieldName, index);
     }
 
-    void createFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) {
+    void createFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) {
       try {
         switch (fieldDescriptor.getJavaType()) {
           case INT:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new IntListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new IntFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new IntListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new IntFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case LONG:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new LongListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new LongFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new LongListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new LongFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case FLOAT:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new FloatListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new FloatFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new FloatListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new FloatFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case DOUBLE:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new DoubleListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new DoubleFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new DoubleListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new DoubleFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case BOOLEAN:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new BooleanListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new BooleanFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new BooleanListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new BooleanFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case STRING:
           case BYTE_STRING:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new ObjectListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new ObjectFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new ObjectListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new ObjectFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case ENUM:
             fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                ? new EnumListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                : new EnumFieldOfObjectWriter(fieldDescriptor, objectClass);
+                ? new EnumListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                : new EnumFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             break;
           case MESSAGE:
             if (fieldDescriptor.isMapField()) {
-              fieldOfObjectWriter = new MapFieldOfObjectWriter(fieldDescriptor, objectClass);
+              fieldOfObjectWriter = new MapFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             } else {
               fieldOfObjectWriter = fieldDescriptor.isRepeated()
-                  ? new ObjectListFieldOfObjectWriter(fieldDescriptor, objectClass)
-                  : new ObjectFieldOfObjectWriter(fieldDescriptor, objectClass);
+                  ? new ObjectListFieldOfObjectWriter(fieldDescriptor, proto3MessageClass)
+                  : new ObjectFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
             }
             break;
         }
@@ -354,25 +331,28 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     final Class<?> messageOrBuilderInterface;
 
     @SuppressWarnings("unchecked")
-    MessageWriter(
-        Descriptor descriptor, GroupType schema, Class<? extends MessageOrBuilder> messageOrBuilderInterface) {
+    MessageWriter(Descriptor descriptor, GroupType schema, Class<? extends Message> proto3MessageClass) {
       List<FieldDescriptor> fields = descriptor.getFields();
       fieldWriters = (FieldWriter[]) Array.newInstance(FieldWriter.class, fields.size());
 
-      ProtobufJavaReflectionUtil.verifyMessageOrBuilderInterface(messageOrBuilderInterface);
-      this.messageOrBuilderInterface = messageOrBuilderInterface;
+      this.messageOrBuilderInterface = proto3MessageClass != null
+          ? ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass)
+          : null;
 
       for (FieldDescriptor fieldDescriptor : fields) {
         String name = fieldDescriptor.getName();
         Type type = schema.getType(name);
-        FieldWriter writer = createWriter(fieldDescriptor, type, messageOrBuilderInterface, null);
+        FieldWriter writer = createWriter(
+            fieldDescriptor,
+            type,
+            ProtobufJavaReflectionUtil.getFieldMessageType(fieldDescriptor, proto3MessageClass));
 
         if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
           writer = new ArrayWriter(writer);
         }
 
-        if (messageOrBuilderInterface != null) {
-          writer.createFieldOfObjectWriter(fieldDescriptor, messageOrBuilderInterface);
+        if (proto3MessageClass != null) {
+          writer.createFieldOfObjectWriter(fieldDescriptor, proto3MessageClass);
         }
 
         writer.setFieldName(name);
@@ -383,16 +363,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private FieldWriter createWriter(
-        FieldDescriptor fieldDescriptor,
-        Type type,
-        Class<?> objectClass,
-        Class<? extends MessageOrBuilder> associatedMessageClass) {
+        FieldDescriptor fieldDescriptor, Type type, Class<? extends Message> fieldMessageType) {
 
       switch (fieldDescriptor.getJavaType()) {
         case STRING:
           return new StringWriter();
         case MESSAGE:
-          return createMessageWriter(fieldDescriptor, type, objectClass, associatedMessageClass);
+          return createMessageWriter(fieldDescriptor, type, fieldMessageType);
         case INT:
           return new IntWriter();
         case LONG:
@@ -413,16 +390,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private FieldWriter createMessageWriter(
-        FieldDescriptor fieldDescriptor,
-        Type type,
-        Class<?> objectClass,
-        Class<? extends MessageOrBuilder> associatedMessageClass) {
+        FieldDescriptor fieldDescriptor, Type type, Class<? extends Message> fieldMessageType) {
       if (fieldDescriptor.isMapField()) {
-        return createMapWriter(
-            fieldDescriptor,
-            type,
-            ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
-                fieldDescriptor, objectClass));
+        return createMapWriter(fieldDescriptor, type, fieldMessageType);
       }
 
       if (unwrapProtoWrappers) {
@@ -471,13 +441,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         return new BinaryWriter();
       }
 
-      return new MessageWriter(
-          fieldDescriptor.getMessageType(),
-          getGroupType(type),
-          associatedMessageClass != null
-              ? associatedMessageClass
-              : ProtobufJavaReflectionUtil.extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
-                  fieldDescriptor, objectClass));
+      return new MessageWriter(fieldDescriptor.getMessageType(), getGroupType(type), fieldMessageType);
     }
 
     private GroupType getGroupType(Type type) {
@@ -511,7 +475,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private MapWriter createMapWriter(
-        FieldDescriptor fieldDescriptor, Type type, Class<? extends MessageOrBuilder> valueMessageOrBuilder) {
+        FieldDescriptor fieldDescriptor, Type type, Class<? extends Message> valueProto3MessageClass) {
       List<FieldDescriptor> fields = fieldDescriptor.getMessageType().getFields();
       if (fields.size() != 2) {
         throw new UnsupportedOperationException(
@@ -520,7 +484,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       // KeyFieldWriter
       FieldDescriptor keyProtoField = fields.get(0);
-      FieldWriter keyWriter = createWriter(keyProtoField, type, null, null);
+      FieldWriter keyWriter = createWriter(keyProtoField, type, null);
       keyWriter.setFieldName(keyProtoField.getName());
       keyWriter.setIndex(0);
 
@@ -529,8 +493,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       FieldWriter valueWriter = createWriter(
           valueProtoField,
           writeSpecsCompliant ? type : type.asGroupType().getType("value"),
-          null,
-          valueMessageOrBuilder);
+          valueProto3MessageClass);
       valueWriter.setFieldName(valueProtoField.getName());
       valueWriter.setIndex(1);
 
@@ -763,14 +726,27 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   static class ProtobufJavaReflectionUtil {
 
-    static Class<? extends MessageOrBuilder> getMessageOrBuilderInterfaceOrNull(Class<?> messageClass) {
+    static Class<? extends Message> getProto3MessageClassOrNull(Class<? extends Message> messageClass) {
       return Stream.of(messageClass)
-          .filter(x -> GeneratedMessageV3.class.isAssignableFrom(x))
+          .filter(Objects::nonNull)
+          .filter(GeneratedMessageV3.class::isAssignableFrom)
+          .filter(x -> Protobufs.getMessageDescriptor(x).getFile().getSyntax()
+              == Descriptors.FileDescriptor.Syntax.PROTO3)
+          .findFirst()
+          .orElse(null);
+    }
+
+    static Class<? extends MessageOrBuilder> getProto3MessageOrBuilderInterface(
+        Class<? extends Message> messageClass) {
+      return Stream.of(getProto3MessageClassOrNull(messageClass))
+          .filter(Objects::nonNull)
           .flatMap(x -> Arrays.stream(x.getInterfaces()))
           .filter(MessageOrBuilder.class::isAssignableFrom)
           .map(x -> (Class<? extends MessageOrBuilder>) x)
           .findFirst()
-          .orElse(null);
+          .orElseThrow(() -> new IllegalStateException(
+              "message class is expected to be a proto3 GeneratedMessageV3 subclass, but got "
+                  + messageClass));
     }
 
     // almost the same as com.google.protobuf.Descriptors.FieldDescriptor#fieldNameToJsonName
@@ -802,21 +778,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       return result.toString();
     }
 
-    static void verifyMessageOrBuilderInterface(Class<?> objectClass) {
-      if (objectClass == null) {
-        return;
-      }
-      if (!objectClass.isInterface() || !MessageOrBuilder.class.isAssignableFrom(objectClass)) {
-        throw new IllegalStateException(
-            "a sub-interface of MessageOrBuilder interface is expected, but got " + objectClass);
-      }
-    }
-
-    static FieldHasValue getHasValueOrNull(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+    static FieldHasValue getHasValueOrNull(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated()) {
         throw new IllegalStateException("not supported for repeated fields");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       if (!fieldDescriptor.hasPresence()) {
         return null;
       }
@@ -835,12 +803,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static GetRepeatedFieldSize getRepeatedFieldSize(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static GetRepeatedFieldSize getRepeatedFieldSize(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated()) {
         throw new IllegalStateException("not supported for non-repeated fields");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (GetRepeatedFieldSize) LambdaMetafactory.metafactory(
               lookup,
@@ -856,12 +825,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static ObjectValueGetter getGetObjectValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static ObjectValueGetter getGetObjectValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated() && !fieldDescriptor.isMapField()) {
         throw new IllegalStateException("not supported for repeated fields");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       String mapOrBuilder = fieldDescriptor.isMapField()
           ? "Map"
@@ -878,13 +848,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static IntValueGetter getGetIntValue(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+    static IntValueGetter getGetIntValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated()
           || !(fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.INT
               || fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM)) {
         throw new IllegalStateException("not supported for repeated fields or non-int or non-enums");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       String enumValueSuffix = fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM ? "Value" : "";
       return (IntValueGetter) LambdaMetafactory.metafactory(
@@ -901,11 +873,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static LongValueGetter getGetLongValue(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
+    static LongValueGetter getGetLongValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.LONG) {
         throw new IllegalStateException("not supported for repeated fields or non-long");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (LongValueGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -921,12 +895,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static DoubleValueGetter getGetDoubleValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static DoubleValueGetter getGetDoubleValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.DOUBLE) {
         throw new IllegalStateException("not supported for repeated fields or non-double");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (DoubleValueGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -942,12 +917,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static FloatValueGetter getGetFloatValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static FloatValueGetter getGetFloatValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.FLOAT) {
         throw new IllegalStateException("not supported for repeated fields or non-float");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (FloatValueGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -963,12 +939,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static BooleanValueGetter getGetBooleanValue(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static BooleanValueGetter getGetBooleanValue(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.BOOLEAN) {
         throw new IllegalStateException("not supported for repeated fields or non-boolean");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (BooleanValueGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -984,12 +961,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static ObjectListElementGetter getGetObjectListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static ObjectListElementGetter getGetObjectListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated() || fieldDescriptor.isMapField()) {
         throw new IllegalStateException("not supported for non-repeated fields or maps");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       String orBuilder =
           !fieldDescriptor.isMapField() && fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE
@@ -1007,14 +985,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static IntListElementGetter getGetIntListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static IntListElementGetter getGetIntListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated()
           || !(fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.INT
               || fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM)) {
         throw new IllegalStateException("not supported for non-repeated fields or non-ints or non-enums");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       String enumValueSuffix = fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM ? "Value" : "";
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (IntListElementGetter) LambdaMetafactory.metafactory(
@@ -1029,12 +1008,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static LongListElementGetter getGetLongListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static LongListElementGetter getGetLongListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.LONG) {
         throw new IllegalStateException("not supported for non-repeated fields or non-longs");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (LongListElementGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -1048,12 +1028,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static DoubleListElementGetter getGetDoubleListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static DoubleListElementGetter getGetDoubleListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.DOUBLE) {
         throw new IllegalStateException("not supported for non-repeated fields or non-doubles");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (DoubleListElementGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -1067,12 +1048,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static FloatListElementGetter getGetFloatListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static FloatListElementGetter getGetFloatListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.FLOAT) {
         throw new IllegalStateException("not supported for non-repeated fields or non-floats");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (FloatListElementGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -1086,12 +1068,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static BooleanListElementGetter getGetBooleanListElement(FieldDescriptor fieldDescriptor, Class<?> objectClass)
-        throws Throwable {
+    static BooleanListElementGetter getGetBooleanListElement(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) throws Throwable {
       if (!fieldDescriptor.isRepeated() || fieldDescriptor.getJavaType() != FieldDescriptor.JavaType.BOOLEAN) {
         throw new IllegalStateException("not supported for non-repeated fields or non-booleans");
       }
-      verifyMessageOrBuilderInterface(objectClass);
+      Class<? extends MessageOrBuilder> objectClass =
+          ProtobufJavaReflectionUtil.getProto3MessageOrBuilderInterface(proto3MessageClass);
       MethodHandles.Lookup lookup = MethodHandles.lookup();
       return (BooleanListElementGetter) LambdaMetafactory.metafactory(
               lookup,
@@ -1105,17 +1088,19 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
-    static Class<? extends MessageOrBuilder> extractAssociatedMessageOrBuilderInterfaceOfFieldValue(
-        FieldDescriptor fieldDescriptor, Class<?> objectClass) {
-      if (objectClass == null) {
+    static Class<? extends Message> getFieldMessageType(
+        FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass) {
+      if (proto3MessageClass == null) {
         return null;
       }
       if (fieldDescriptor.isMapField()) {
         try {
-          Method getter = objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "Map");
+          Method getter =
+              proto3MessageClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "Map");
           ParameterizedType mapKV = (ParameterizedType) getter.getGenericReturnType();
-          Class<?> valueClass = (Class<?>) mapKV.getActualTypeArguments()[1]; // value
-          return ProtobufJavaReflectionUtil.getMessageOrBuilderInterfaceOrNull(valueClass);
+          Class<? extends Message> valueClass =
+              (Class<? extends Message>) mapKV.getActualTypeArguments()[1]; // value
+          return ProtobufJavaReflectionUtil.getProto3MessageClassOrNull(valueClass);
         } catch (Exception e) {
           throw new UnsupportedOperationException(
               "could not find a getter method for a map field: " + fieldDescriptor, e);
@@ -1123,22 +1108,20 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       } else if (fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE) {
         if (fieldDescriptor.isRepeated()) {
           try {
-            Method getter = objectClass.getMethod(
-                "get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder", int.class);
-            Class<?> elementClass = getter.getReturnType(); // element
-            verifyMessageOrBuilderInterface(elementClass);
-            return (Class<? extends MessageOrBuilder>) elementClass;
+            Method getter =
+                proto3MessageClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor), int.class);
+            Class<? extends Message> elementClass =
+                (Class<? extends Message>) getter.getReturnType(); // element
+            return ProtobufJavaReflectionUtil.getProto3MessageClassOrNull(elementClass);
           } catch (Exception e) {
             throw new UnsupportedOperationException(
                 "could not find a getter method for a repeated field: " + fieldDescriptor, e);
           }
         } else {
           try {
-            Method getter =
-                objectClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor) + "OrBuilder");
-            Class<?> elementClass = getter.getReturnType();
-            verifyMessageOrBuilderInterface(elementClass);
-            return (Class<? extends MessageOrBuilder>) elementClass;
+            Method getter = proto3MessageClass.getMethod("get" + getFieldNameForMethod(fieldDescriptor));
+            Class<? extends Message> elementClass = (Class<? extends Message>) getter.getReturnType();
+            return ProtobufJavaReflectionUtil.getProto3MessageClassOrNull(elementClass);
           } catch (Exception e) {
             throw new UnsupportedOperationException(
                 "could not find a getter method for a non-repeated field: " + fieldDescriptor, e);
@@ -1156,9 +1139,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     FieldWriter fieldWriter;
 
-    ObjectFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
+    ObjectFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1184,9 +1168,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     FieldWriter elementWriter;
 
-    ObjectListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, objectClass);
+    ObjectListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement =
+          ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1226,9 +1213,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     IntWriter fieldWriter;
 
-    IntFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, objectClass);
+    IntFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1254,9 +1242,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     IntWriter elementWriter;
 
-    IntListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, objectClass);
+    IntListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1299,9 +1289,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     LongWriter fieldWriter;
 
-    LongFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetLongValue(fieldDescriptor, objectClass);
+    LongFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetLongValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1327,9 +1318,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     LongWriter elementWriter;
 
-    LongListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetLongListElement(fieldDescriptor, objectClass);
+    LongListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement = ProtobufJavaReflectionUtil.getGetLongListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1375,9 +1368,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     FieldWriter keyWriter;
     FieldWriter valueWriter;
 
-    MapFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getMap = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
+    MapFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getMap = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1464,9 +1459,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     FloatWriter fieldWriter;
 
-    FloatFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetFloatValue(fieldDescriptor, objectClass);
+    FloatFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetFloatValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1492,9 +1488,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     FloatWriter elementWriter;
 
-    FloatListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetFloatListElement(fieldDescriptor, objectClass);
+    FloatListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement =
+          ProtobufJavaReflectionUtil.getGetFloatListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1538,9 +1537,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     DoubleWriter fieldWriter;
 
-    DoubleFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetDoubleValue(fieldDescriptor, objectClass);
+    DoubleFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetDoubleValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1566,9 +1566,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     DoubleWriter elementWriter;
 
-    DoubleListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetDoubleListElement(fieldDescriptor, objectClass);
+    DoubleListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement =
+          ProtobufJavaReflectionUtil.getGetDoubleListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1614,10 +1617,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     EnumWriter fieldWriter;
 
-    EnumFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getEnum = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, objectClass);
-      this.getEnumValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, objectClass);
+    EnumFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getEnum = ProtobufJavaReflectionUtil.getGetObjectValue(fieldDescriptor, proto3MessageClass);
+      this.getEnumValue = ProtobufJavaReflectionUtil.getGetIntValue(fieldDescriptor, proto3MessageClass);
       this.enumDescriptor = fieldDescriptor.getEnumType();
       this.enumValues = enumDescriptor.getValues();
     }
@@ -1658,11 +1662,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     EnumWriter elementWriter;
 
-    EnumListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getEnumListElement = ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, objectClass);
+    EnumListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getEnumListElement =
+          ProtobufJavaReflectionUtil.getGetObjectListElement(fieldDescriptor, proto3MessageClass);
       this.getEnumValueListElement =
-          ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, objectClass);
+          ProtobufJavaReflectionUtil.getGetIntListElement(fieldDescriptor, proto3MessageClass);
       this.enumDescriptor = fieldDescriptor.getEnumType();
       this.enumValues = enumDescriptor.getValues();
     }
@@ -1725,9 +1732,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     BooleanWriter fieldWriter;
 
-    BooleanFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, objectClass);
-      this.getValue = ProtobufJavaReflectionUtil.getGetBooleanValue(fieldDescriptor, objectClass);
+    BooleanFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.fieldHasValue = ProtobufJavaReflectionUtil.getHasValueOrNull(fieldDescriptor, proto3MessageClass);
+      this.getValue = ProtobufJavaReflectionUtil.getGetBooleanValue(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
@@ -1753,9 +1761,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     ArrayWriter arrayWriter;
     BooleanWriter elementWriter;
 
-    BooleanListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<?> objectClass) throws Throwable {
-      this.getRepeatedFieldSize = ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, objectClass);
-      this.getListElement = ProtobufJavaReflectionUtil.getGetBooleanListElement(fieldDescriptor, objectClass);
+    BooleanListFieldOfObjectWriter(FieldDescriptor fieldDescriptor, Class<? extends Message> proto3MessageClass)
+        throws Throwable {
+      this.getRepeatedFieldSize =
+          ProtobufJavaReflectionUtil.getRepeatedFieldSize(fieldDescriptor, proto3MessageClass);
+      this.getListElement =
+          ProtobufJavaReflectionUtil.getGetBooleanListElement(fieldDescriptor, proto3MessageClass);
     }
 
     @Override
