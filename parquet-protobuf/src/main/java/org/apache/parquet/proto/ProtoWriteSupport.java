@@ -1159,6 +1159,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .findFirst();
     }
 
+    static Method getDeclaredMethod(Class<?> proto3MessageOrBuilderInterface, String name, FieldDescriptor fieldDescriptor, Class<?> ... parameters) {
+      return getDeclaredMethod(proto3MessageOrBuilderInterface, name.replace("{}", getFieldNameForMethod(fieldDescriptor)), parameters);
+    }
+
     // almost the same as com.google.protobuf.Descriptors.FieldDescriptor#fieldNameToJsonName
     // but capitalizing the first letter after each last digit
     static String getFieldNameForMethod(FieldDescriptor fieldDescriptor) {
@@ -1368,12 +1372,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$" + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet())
           .make();
 
-//       try {
-//         unloaded.saveIn(new File("generated_debug"));
-//       } catch (Exception e) {
-//
-//       }
-
+//       try { unloaded.saveIn(new java.io.File("generated_debug")); } catch (Exception e) {}
 
       furtherFieldWriters.addAll(impl.notOptimizedMessageWriters);
 
@@ -1461,6 +1460,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         boolean isRepeated() {
           return arrayWriter != null;
+        }
+
+        boolean isOptional() {
+          return fieldWriter.fieldDescriptor.hasPresence();
         }
 
         boolean isPrimitive() {
@@ -1729,7 +1732,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 steps.add(castToProto3MessageOrBuilderInterface(proto3MessageOrBuilder, messageOrBuilderArg, proto3MessageOrBuilderInterface));
               }
               try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
-                storeRecordConsumer(recordConsumerVar);
+                steps.add(storeRecordConsumer(recordConsumerVar));
 
                 writeMessageFieldsInternal(proto3MessageOrBuilder, recordConsumerVar, fieldPath, messageWriter, proto3MessageOrBuilderInterface);
               }
@@ -1763,13 +1766,20 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
             @Override
             public void visitNonMessageField(RegularField field) {
-              JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter = JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.arrayWriter != null ? field.arrayWriter.fieldDescriptor : field.fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
-              fieldOfObjectWriter.setFieldWriter(field.arrayWriter != null ? field.arrayWriter : field.fieldWriter);
+              Implementation implementation = null;
+              if (field.isPrimitive()) {
+                implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
+              }
+              if (implementation == null) {
+                JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter = JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.arrayWriter != null ? field.arrayWriter.fieldDescriptor : field.fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+                fieldOfObjectWriter.setFieldWriter(field.arrayWriter != null ? field.arrayWriter : field.fieldWriter);
 
-              steps.add(MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                  .on(fieldOfObjectWriter)
-                  .withArgument(0)
-                  .andThen(NOOP));
+                implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
+                    .on(fieldOfObjectWriter)
+                    .withArgument(0)
+                    .andThen(NOOP);
+              }
+              steps.add(implementation);
             }
 
             @Override
@@ -1798,6 +1808,28 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           });
         }
 
+        private Implementation writePrimitiveField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                         MessageWriterVisitor.RegularField field) {
+          if (field.isRepeated() || field.isOptional()) {
+            return null;
+          } else {
+            return toImplementation(
+                recordConsumerVar.load(),
+                new TextConstant(field.fieldWriter.fieldName),
+                IntegerConstant.forValue(field.fieldWriter.index),
+                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.startField)),
+                recordConsumerVar.load(),
+                proto3MessageOrBuilder.load(),
+                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(ReflectionUtil.getDeclaredMethod(proto3MessageOrBuilder.clazz(), "get{}", field.fieldWriter.fieldDescriptor))),
+                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.fieldWriter.getFieldReflectionType()))),
+                recordConsumerVar.load(),
+                new TextConstant(field.fieldWriter.fieldName),
+                IntegerConstant.forValue(field.fieldWriter.index),
+                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.endField))
+            );
+          }
+        }
+
         protected static Implementation returnTrue() {
           return FixedValue.value(true);
         }
@@ -1818,9 +1850,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                                                                         LocalVar src,
                                                                         Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
           return toImplementation(
-                  MethodVariableAccess.REFERENCE.loadFrom(src.offset()),
+                  src.load(),
+//                   MethodVariableAccess.REFERENCE.loadFrom(src.offset()),
                   TypeCasting.to(TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface)),
-                  MethodVariableAccess.REFERENCE.storeAt(dest.offset()));
+                  dest.store()
+//                   MethodVariableAccess.REFERENCE.storeAt(dest.offset())
+          );
         }
 
         protected Implementation returnFalseIfNotInstanceOf(LocalVar var, Class<?> clazz) {
@@ -1845,7 +1880,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       private String newMethodForFieldPath(FieldPath fieldPath) {
         String methodName;
-        if ("".equals(fieldPath.getField())) {
+        if (fieldPath.isRoot()) {
           methodName = Reflection.FastMessageWriter.writeAllFields.getName();
           if (!fieldPathToMethodName.isEmpty()) {
             throw new IllegalStateException();
@@ -1885,13 +1920,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       static class LocalVar implements AutoCloseable {
         final LocalVars vars;
         final TypeDescription typeDescription;
+        final Class<?> clazz;
         final int stackSize;
 
         int refCount;
 
         int offset;
 
-        LocalVar(TypeDescription typeDescription, LocalVars vars) {
+        LocalVar(Class<?> clazz, TypeDescription typeDescription, LocalVars vars) {
+          this.clazz = clazz;
           this.typeDescription = typeDescription;
           this.vars = vars;
           this.stackSize = StackSize.of(typeDescription);
@@ -1908,6 +1945,21 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         TypeDescription typeDescription() {
           return typeDescription;
+        }
+
+        StackManipulation load() {
+          return MethodVariableAccess.of(typeDescription()).loadFrom(offset());
+        }
+
+        StackManipulation store() {
+          return MethodVariableAccess.of(typeDescription()).storeAt(offset());
+        }
+
+        Class<?> clazz() {
+          if (clazz == null) {
+            throw new IllegalStateException();
+          }
+          return clazz;
         }
 
         int stackSize() {
@@ -2010,12 +2062,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         LocalVar register(TypeDescription typeDescription) {
-          LocalVar var = new LocalVar(typeDescription, this);
+          LocalVar var = new LocalVar(null, typeDescription, this);
           return register(var);
         }
 
         LocalVar register(Class<?> clazz) {
-          return register(TypeDescription.ForLoadedType.of(clazz));
+          LocalVar var = new LocalVar(clazz, TypeDescription.ForLoadedType.of(clazz), this);
+          return register(var);
         }
 
         Implementation asImplementation() {
