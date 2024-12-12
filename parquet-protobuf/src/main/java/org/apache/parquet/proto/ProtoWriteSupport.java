@@ -1401,7 +1401,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         final List<String> path = new ArrayList<>();
 
         String getField() {
-          return path.isEmpty() ? "" : path.get(path.size() - 1);
+          return isRoot() ? "" : path.get(path.size() - 1);
+        }
+
+        boolean isRoot() {
+          return path.isEmpty();
         }
 
         FieldPath push(String segment) {
@@ -1702,14 +1706,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         @Override
         public ByteCodeAppender appender(Target implementationTarget) {
-          return new ByteCodeAppender() {
-            @Override
-            public Size apply(MethodVisitor methodVisitor, Context implementationContext,
-                              MethodDescription instrumentedMethod) {
-              return new Size(compound.appender(implementationTarget).apply(methodVisitor, implementationContext, instrumentedMethod).getOperandStackSize(),
-                  localVars.getMaxSize());
-            }
-          };
+          return compound.appender(implementationTarget);
         }
 
         @Override
@@ -1741,7 +1738,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           if (rootMessage) {
             steps.add(returnTrue());
           } else {
-            steps.add(new Implementation.Simple(new ByteCodeAppender.Simple(MethodReturn.VOID)));
+            steps.add(returnVoid());
           }
         }
 
@@ -1800,19 +1797,36 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           });
         }
 
-        protected Implementation returnTrue() {
+        protected static Implementation returnTrue() {
           return FixedValue.value(true);
+        }
+
+        protected static Implementation returnVoid() {
+          return toImplementation(MethodReturn.VOID);
+        }
+
+        protected static Implementation toImplementation(Implementation ... implementations) {
+          return new Implementation.Compound(implementations);
+        }
+
+        protected static Implementation toImplementation(ByteCodeAppender ... appenders) {
+          return new Implementation.Simple(appenders);
+        }
+
+        protected static Implementation toImplementation(StackManipulation ... stackManipulations) {
+          return new Implementation.Simple(stackManipulations);
         }
 
         protected Implementation storeRecordConsumer(String recordConsumerVarName) {
           int recordConsumerVarOffset = localVars.addReturningOffset(recordConsumerVarName, TypeDescription.ForLoadedType.of(RecordConsumer.class));
 
-          return new Implementation.Compound(
-              new Implementation.Simple(new StackManipulation.Compound(
+          return toImplementation(
+              localVars.asImplementation(),
+              toImplementation(
                   MethodVariableAccess.loadThis(),
                   MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(
                       Reflection.ByteBuddyProto3FastMessageWriter.getRecordConsumer)),
-                  MethodVariableAccess.REFERENCE.storeAt(recordConsumerVarOffset)))
+                  MethodVariableAccess.REFERENCE.storeAt(recordConsumerVarOffset))
           );
         }
 
@@ -1821,12 +1835,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                                                                         Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
           int newProto3MessageOrBuilderInterfaceVarOffset = localVars.addReturningOffset(newProto3MessageOrBuilderInterfaceVarName, TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface));
 
-          return new Implementation.Compound(
-              new Implementation.Simple(new StackManipulation.Compound(
+          return toImplementation(
+              localVars.asImplementation(),
+              toImplementation(
                   MethodVariableAccess.REFERENCE.loadFrom(localVars.offset(messageOrBuilderVarName)),
                   TypeCasting.to(TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface)),
                   MethodVariableAccess.REFERENCE.storeAt(newProto3MessageOrBuilderInterfaceVarOffset)
-              ))
+              )
           );
         }
 
@@ -1909,6 +1924,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           stackSizes.add(StackSize.of(typeDescription));
           maxSize = Math.max(maxSize, getSize());
           return offsets.get(offsets.size() - 1);
+        }
+
+        Implementation asImplementation() {
+          return new Implementation.Simple(new ByteCodeAppender() {
+            @Override
+            public Size apply(MethodVisitor methodVisitor, Context implementationContext,
+                              MethodDescription instrumentedMethod) {
+              return new Size(0, getMaxSize());
+            }
+          });
         }
 
         int getMaxSize() {
