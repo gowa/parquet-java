@@ -45,7 +45,6 @@ import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
 import com.twitter.elephantbird.util.Protobufs;
-import java.io.File;
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -58,6 +57,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -1656,9 +1656,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           this.arrayWriter = arrayWriter;
           this.proto3MessageOrBuilderInterface = proto3MessageOrBuilderInterface;
 
-          localVars.add("this", typeDescription);
-
-          writeMessageFields(fieldPath, fieldWriter, proto3MessageOrBuilderInterface);
+          try (LocalVar thisLocalVar = localVars.register(typeDescription)) {
+            writeMessageFields(fieldPath, fieldWriter, proto3MessageOrBuilderInterface);
+          }
         }
 
         @Override
@@ -1695,12 +1695,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       abstract static class WritAllFieldsImplementation implements Implementation {
-        static final String VAR_MESSAGE_OR_BUILDER = "messageOrBuilder";
-        static final String VAR_PROTO3_MESSAGE_OR_BUILDER = "proto3MessageOrBuilder";
-        static final String VAR_RECORD_CONSUMER = "recordConsumer";
-
-        final LocalVars localVars = new LocalVars();
         final List<Implementation> steps = new ArrayList<>();
+        final LocalVars localVars = new LocalVars(steps);
 
         Implementation compound;
 
@@ -1722,27 +1718,32 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         protected abstract InstrumentedType registerMethod(InstrumentedType instrumentedType);
 
         protected void writeMessageFields(FieldPath fieldPath, ProtoWriteSupport<?>.MessageWriter messageWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          boolean rootMessage = fieldPath.path.isEmpty();
-          if (rootMessage) {
-            localVars.add(VAR_MESSAGE_OR_BUILDER, TypeDescription.ForLoadedType.of(MessageOrBuilder.class));
-            steps.add(returnFalseIfNotInstanceOf(VAR_MESSAGE_OR_BUILDER, proto3MessageOrBuilderInterface));
-            steps.add(castToProto3MessageOrBuilderInterface(VAR_PROTO3_MESSAGE_OR_BUILDER, VAR_MESSAGE_OR_BUILDER, proto3MessageOrBuilderInterface));
-          } else {
-            // comes directly as method parameter
-            localVars.add(VAR_PROTO3_MESSAGE_OR_BUILDER, TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface));
-          }
-          steps.add(storeRecordConsumer(VAR_RECORD_CONSUMER));
+          boolean rootMessage = fieldPath.isRoot();
 
-          writeMessageFieldsInternal(VAR_PROTO3_MESSAGE_OR_BUILDER, VAR_RECORD_CONSUMER, fieldPath, messageWriter, proto3MessageOrBuilderInterface);
+          try (LocalVar messageOrBuilderArg = localVars.register(rootMessage ? MessageOrBuilder.class : proto3MessageOrBuilderInterface)) {
+            if (rootMessage) {
+              steps.add(returnFalseIfNotInstanceOf(messageOrBuilderArg, proto3MessageOrBuilderInterface));
+            }
+            try (LocalVar proto3MessageOrBuilder = rootMessage ? localVars.register(proto3MessageOrBuilderInterface) : messageOrBuilderArg.alias()) {
+              if (rootMessage) {
+                steps.add(castToProto3MessageOrBuilderInterface(proto3MessageOrBuilder, messageOrBuilderArg, proto3MessageOrBuilderInterface));
+              }
+              try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
+                storeRecordConsumer(recordConsumerVar);
 
-          if (rootMessage) {
-            steps.add(returnTrue());
-          } else {
-            steps.add(returnVoid());
+                writeMessageFieldsInternal(proto3MessageOrBuilder, recordConsumerVar, fieldPath, messageWriter, proto3MessageOrBuilderInterface);
+              }
+            }
+
+            if (rootMessage) {
+              steps.add(returnTrue());
+            } else {
+              steps.add(returnVoid());
+            }
           }
         }
 
-        protected void writeMessageFieldsInternal(String proto3MessageOrBuilderVarName, String recordConsumerVarName, FieldPath fieldPath,
+        protected void writeMessageFieldsInternal(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, FieldPath fieldPath,
                                                              ProtoWriteSupport<?>.MessageWriter messageWriter,
                                                              Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
 
@@ -1805,48 +1806,25 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           return toImplementation(MethodReturn.VOID);
         }
 
-        protected static Implementation toImplementation(Implementation ... implementations) {
-          return new Implementation.Compound(implementations);
-        }
-
-        protected static Implementation toImplementation(ByteCodeAppender ... appenders) {
-          return new Implementation.Simple(appenders);
-        }
-
-        protected static Implementation toImplementation(StackManipulation ... stackManipulations) {
-          return new Implementation.Simple(stackManipulations);
-        }
-
-        protected Implementation storeRecordConsumer(String recordConsumerVarName) {
-          int recordConsumerVarOffset = localVars.addReturningOffset(recordConsumerVarName, TypeDescription.ForLoadedType.of(RecordConsumer.class));
-
+        protected Implementation storeRecordConsumer(LocalVar recordConsumerVar) {
           return toImplementation(
-              localVars.asImplementation(),
-              toImplementation(
                   MethodVariableAccess.loadThis(),
                   MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(
                       Reflection.ByteBuddyProto3FastMessageWriter.getRecordConsumer)),
-                  MethodVariableAccess.REFERENCE.storeAt(recordConsumerVarOffset))
-          );
+                  MethodVariableAccess.REFERENCE.storeAt(recordConsumerVar.offset()));
         }
 
-        protected Implementation castToProto3MessageOrBuilderInterface(String newProto3MessageOrBuilderInterfaceVarName,
-                                                                        String messageOrBuilderVarName,
+        protected Implementation castToProto3MessageOrBuilderInterface(LocalVar dest,
+                                                                        LocalVar src,
                                                                         Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          int newProto3MessageOrBuilderInterfaceVarOffset = localVars.addReturningOffset(newProto3MessageOrBuilderInterfaceVarName, TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface));
-
           return toImplementation(
-              localVars.asImplementation(),
-              toImplementation(
-                  MethodVariableAccess.REFERENCE.loadFrom(localVars.offset(messageOrBuilderVarName)),
+                  MethodVariableAccess.REFERENCE.loadFrom(src.offset()),
                   TypeCasting.to(TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface)),
-                  MethodVariableAccess.REFERENCE.storeAt(newProto3MessageOrBuilderInterfaceVarOffset)
-              )
-          );
+                  MethodVariableAccess.REFERENCE.storeAt(dest.offset()));
         }
 
-        protected Implementation returnFalseIfNotInstanceOf(String varName, Class<?> clazz) {
-          int varOffset = localVars.offset(varName);
+        protected Implementation returnFalseIfNotInstanceOf(LocalVar var, Class<?> clazz) {
+          int varOffset = var.offset();
           List<TypeDescription> types = localVars.types();
           return new Implementation.Simple(new StackManipulation.AbstractBase() {
             @Override
@@ -1892,95 +1870,179 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         return instrumentedType;
       }
 
-      static class LocalVars {
-        List<String> names = new ArrayList<>();
-        List<TypeDescription> types = new ArrayList<>();
-        List<Integer> offsets = new ArrayList<>();
-        List<Integer> stackSizes = new ArrayList<>();
-        int maxSize;
+      protected static Implementation toImplementation(Implementation ... implementations) {
+        return new Implementation.Compound(implementations);
+      }
 
-        int offset(String name) {
-          int idx = idxOfDefinedVar(name);
-          return offsets.get(idx);
+      protected static Implementation toImplementation(ByteCodeAppender ... appenders) {
+        return new Implementation.Simple(appenders);
+      }
+
+      protected static Implementation toImplementation(StackManipulation ... stackManipulations) {
+        return new Implementation.Simple(stackManipulations);
+      }
+
+      static class LocalVar implements AutoCloseable {
+        final LocalVars vars;
+        final TypeDescription typeDescription;
+        final int stackSize;
+
+        int refCount;
+
+        int offset;
+
+        LocalVar(TypeDescription typeDescription, LocalVars vars) {
+          this.typeDescription = typeDescription;
+          this.vars = vars;
+          this.stackSize = StackSize.of(typeDescription);
         }
 
-        LocalVars add(String name, TypeDescription typeDescription) {
-          addReturningOffset(name, typeDescription);
+        LocalVars vars() {
+          return vars;
+        }
+
+        int offset() {
+          assertRegistered();
+          return offset;
+        }
+
+        TypeDescription typeDescription() {
+          return typeDescription;
+        }
+
+        int stackSize() {
+          return stackSize;
+        }
+
+        LocalVar register() {
+          vars.register(this);
           return this;
         }
 
-        int addReturningOffset(String name, TypeDescription typeDescription) {
-          if (names.contains(name)) {
-            throw new IllegalStateException();
+        LocalVar alias() {
+          assertRegistered();
+          refCount += 1;
+          return this;
+        }
+
+        LocalVar unregister() {
+          int index = assertRegistered();
+          refCount -= 1;
+          if (refCount == 0) {
+            if (index != vars.vars.size() - 1) {
+              throw new IllegalStateException("cannot deregister var " + this + "  from " + vars.vars);
+            }
+            vars.vars.remove(this);
           }
-          if (offsets.isEmpty()) {
-            offsets.add(0);
-          } else {
-            int lastVarIdx = offsets.size() - 1;
-            offsets.add(offsets.get(lastVarIdx) + stackSizes.get(lastVarIdx));
+          return this;
+        }
+
+        int assertRegistered() {
+          int index = getIndex();
+          if (index < 0) {
+            throw new IllegalStateException("not registered");
           }
-          names.add(name);
-          types.add(typeDescription);
-          stackSizes.add(StackSize.of(typeDescription));
-          maxSize = Math.max(maxSize, getSize());
-          return offsets.get(offsets.size() - 1);
+          return index;
+        }
+
+        int getIndex() {
+          return vars.vars.indexOf(this);
+        }
+
+        @Override
+        public void close() {
+          unregister();
+        }
+
+        public List<TypeDescription> typesBefore() {
+          int index = assertRegistered();
+          List<TypeDescription> types = new ArrayList<>();
+          List<LocalVar> localVars = vars.vars;
+          for (int i = 0; i < index; i++) {
+            LocalVar var = localVars.get(i);
+            types.add(var.typeDescription);
+          }
+          return types;
+        }
+
+        public List<TypeDescription> typesFrom() {
+          int index = assertRegistered();
+          List<TypeDescription> types = new ArrayList<>();
+          List<LocalVar> localVars = vars.vars;
+          for (int i = index; i < localVars.size(); i++) {
+            LocalVar var = localVars.get(i);
+            types.add(var.typeDescription);
+          }
+          return types;
+        }
+
+        @Override
+        public String toString() {
+          return "LocalVar{" +
+              "vars=" + vars +
+              ", typeDescription=" + typeDescription +
+              ", stackSize=" + stackSize +
+              ", offset=" + offset +
+              '}';
+        }
+      }
+
+      static class LocalVars {
+        final List<Implementation> steps;
+        List<LocalVar> vars = new ArrayList<>();
+
+        LocalVars(List<Implementation> steps) {
+          this.steps = steps;
+        }
+
+        LocalVar register(LocalVar var) {
+          if (vars.contains(var)) {
+            throw new IllegalStateException("cannot register var twice: " + var +", " + vars);
+          }
+          int offset = vars.isEmpty() ? 0 : vars.get(vars.size() - 1).offset + vars.get(vars.size() - 1).stackSize;
+          vars.add(var);
+          var.offset = offset;
+          var.refCount = 1;
+
+          steps.add(asImplementation());
+
+          return var;
+        }
+
+        LocalVar register(TypeDescription typeDescription) {
+          LocalVar var = new LocalVar(typeDescription, this);
+          return register(var);
+        }
+
+        LocalVar register(Class<?> clazz) {
+          return register(TypeDescription.ForLoadedType.of(clazz));
         }
 
         Implementation asImplementation() {
-          return new Implementation.Simple(new ByteCodeAppender() {
+          int size = getSize();
+          return toImplementation(new ByteCodeAppender() {
             @Override
             public Size apply(MethodVisitor methodVisitor, Context implementationContext,
                               MethodDescription instrumentedMethod) {
-              return new Size(0, getMaxSize());
+              return new Size(0, size);
             }
           });
         }
 
-        int getMaxSize() {
-          return maxSize;
-        }
-
         int getSize() {
           int size = 0;
-          for (Integer stackSize : stackSizes) {
-            size += stackSize;
+          for (LocalVar var : vars) {
+            size += var.stackSize();
           }
           return size;
         }
 
-        private int idxOfDefinedVar(String name) {
-          int idx = names.indexOf(name);
-          if (idx < 0) {
-            throw new IllegalStateException();
-          }
-          return idx;
-        }
-
-        LocalVars dropLast(String name) {
-          int offset = offset(name);
-          int lastVarIdx = names.size() - 1;
-          if (offset != lastVarIdx) {
-            throw new IllegalStateException();
-          }
-          names.remove(lastVarIdx);
-          types.remove(lastVarIdx);
-          offsets.remove(lastVarIdx);
-          stackSizes.remove(lastVarIdx);
-          return this;
-        }
-
-        List<TypeDescription> typesBefore(String name) {
-          int idx = idxOfDefinedVar(name);
-          return new ArrayList<>(types.subList(0, idx));
-        }
-
-        List<TypeDescription> typesFrom(String name) {
-          int idx = idxOfDefinedVar(name);
-          return new ArrayList<>(types.subList(idx, types.size()));
-        }
-
         List<TypeDescription> types() {
-          return new ArrayList<>(types);
+          List<TypeDescription> types = new ArrayList<>();
+          for (LocalVar var : vars) {
+            types.add(var.typeDescription);
+          }
+          return types;
         }
       }
 
