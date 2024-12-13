@@ -1372,7 +1372,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$" + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet())
           .make();
 
-//       try { unloaded.saveIn(new java.io.File("generated_debug")); } catch (Exception e) {}
+      try { unloaded.saveIn(new java.io.File("generated_debug")); } catch (Exception e) {}
 
       furtherFieldWriters.addAll(impl.notOptimizedMessageWriters);
 
@@ -1700,6 +1700,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       abstract static class WritAllFieldsImplementation implements Implementation {
         final List<Implementation> steps = new ArrayList<>();
         final LocalVars localVars = new LocalVars(steps);
+        final List<List<TypeDescription>> frames = new ArrayList<>();
 
         Implementation compound;
 
@@ -1724,6 +1725,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           boolean rootMessage = fieldPath.isRoot();
 
           try (LocalVar messageOrBuilderArg = localVars.register(rootMessage ? MessageOrBuilder.class : proto3MessageOrBuilderInterface)) {
+            localVars.frameEmptyStack();
+
             if (rootMessage) {
               steps.add(returnFalseIfNotInstanceOf(messageOrBuilderArg, proto3MessageOrBuilderInterface));
             }
@@ -1810,10 +1813,22 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         private Implementation writePrimitiveField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
                                          MessageWriterVisitor.RegularField field) {
-          if (field.isRepeated() || field.isOptional()) {
+          if (field.isRepeated()) {
             return null;
           } else {
+            Label afterEndField = new Label();
             return toImplementation(
+                field.isOptional() ? new StackManipulation.Compound(
+                    proto3MessageOrBuilder.load(),
+                    MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(ReflectionUtil.getDeclaredMethod(proto3MessageOrBuilder.clazz(), "has{}", field.fieldWriter.fieldDescriptor))),
+                    new StackManipulation.AbstractBase() {
+                      @Override
+                      public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                        methodVisitor.visitJumpInsn(Opcodes.IFEQ, afterEndField);
+                        return Size.ZERO;
+                      }
+                    }
+                ) : StackManipulation.Trivial.INSTANCE,
                 recordConsumerVar.load(),
                 new TextConstant(field.fieldWriter.fieldName),
                 IntegerConstant.forValue(field.fieldWriter.index),
@@ -1825,7 +1840,17 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 recordConsumerVar.load(),
                 new TextConstant(field.fieldWriter.fieldName),
                 IntegerConstant.forValue(field.fieldWriter.index),
-                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.endField))
+                MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.endField)),
+                field.isOptional() ? new StackManipulation.Compound(
+                    new StackManipulation.AbstractBase() {
+                      @Override
+                      public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                        methodVisitor.visitLabel(afterEndField);
+                        return Size.ZERO;
+                      }
+                    },
+                    localVars.frameEmptyStack()
+                ) : StackManipulation.Trivial.INSTANCE
             );
           }
         }
@@ -1860,8 +1885,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         protected Implementation returnFalseIfNotInstanceOf(LocalVar var, Class<?> clazz) {
           int varOffset = var.offset();
-          List<TypeDescription> types = localVars.types();
-          return new Implementation.Simple(new StackManipulation.AbstractBase() {
+//           List<TypeDescription> types = localVars.types();
+          return toImplementation(new StackManipulation.AbstractBase() {
             @Override
             public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
               methodVisitor.visitVarInsn(Opcodes.ALOAD, varOffset);
@@ -1871,10 +1896,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               methodVisitor.visitInsn(Opcodes.ICONST_0);
               methodVisitor.visitInsn(Opcodes.IRETURN);
               methodVisitor.visitLabel(afterInstanceOf);
-              implementationContext.getFrameGeneration().same(methodVisitor, types);
+//               implementationContext.getFrameGeneration().same(methodVisitor, types);
               return Size.ZERO;
             }
-          });
+          },
+              localVars.frameEmptyStack());
         }
       }
 
@@ -2041,6 +2067,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       static class LocalVars {
         final List<Implementation> steps;
+        final List<TypeDescription> frame = new ArrayList<>();
         List<LocalVar> vars = new ArrayList<>();
 
         LocalVars(List<Implementation> steps) {
@@ -2059,6 +2086,84 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           steps.add(asImplementation());
 
           return var;
+        }
+
+        StackManipulation frameEmptyStack() {
+          List<TypeDescription> currTypes = types();
+          List<TypeDescription> frame = new ArrayList<>(this.frame);
+          try {
+            if (currTypes.size() < frame.size()) {
+              int commonLength = commonTypesLength(currTypes, frame);
+              if (commonLength < currTypes.size() || frame.size() - currTypes.size() > 3) {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().full(methodVisitor, Collections.emptyList(), currTypes);
+                    return Size.ZERO;
+                  }
+                };
+              } else {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().chop(methodVisitor, frame.size() - currTypes.size(), currTypes);
+                    return Size.ZERO;
+                  }
+                };
+              }
+            } else if (currTypes.size() == frame.size()) {
+              int commonLength = commonTypesLength(currTypes, frame);
+              if (commonLength != currTypes.size()) {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().full(methodVisitor, Collections.emptyList(), currTypes);
+                    return Size.ZERO;
+                  }
+                };
+              } else {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().same(methodVisitor, currTypes);
+                    return Size.ZERO;
+                  }
+                };
+              }
+            } else {
+              int commonLength = commonTypesLength(currTypes, frame);
+              if (commonLength < frame.size() || currTypes.size() - frame.size() > 3) {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().full(methodVisitor, Collections.emptyList(), currTypes);
+                    return Size.ZERO;
+                  }
+                };
+              } else {
+                return new StackManipulation.AbstractBase() {
+                  @Override
+                  public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                    implementationContext.getFrameGeneration().append(methodVisitor, currTypes.subList(frame.size(), currTypes.size()), frame);
+                    return Size.ZERO;
+                  }
+                };
+              }
+            }
+          } finally {
+            this.frame.clear();
+            this.frame.addAll(currTypes);
+          }
+        }
+
+        int commonTypesLength(List<TypeDescription> a, List<TypeDescription> b) {
+          int len = Math.min(a.size(), b.size());
+          for (int i = 0; i < len; i++) {
+            if (!Objects.equals(a.get(i), b.get(i))) {
+              return i;
+            }
+          }
+          return len;
         }
 
         LocalVar register(TypeDescription typeDescription) {
