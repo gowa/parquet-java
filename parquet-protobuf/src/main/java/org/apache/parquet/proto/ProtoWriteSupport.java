@@ -66,6 +66,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Stream;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.description.method.MethodDescription;
@@ -81,6 +83,7 @@ import net.bytebuddy.implementation.MethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
 import net.bytebuddy.implementation.bytecode.StackManipulation;
 import net.bytebuddy.implementation.bytecode.StackSize;
+import net.bytebuddy.implementation.bytecode.assign.InstanceCheck;
 import net.bytebuddy.implementation.bytecode.assign.TypeCasting;
 import net.bytebuddy.implementation.bytecode.constant.IntegerConstant;
 import net.bytebuddy.implementation.bytecode.constant.TextConstant;
@@ -1374,8 +1377,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         ProtoWriteSupport<?>.MessageWriter messageWriter,
         Queue<ProtoWriteSupport<?>.FieldWriter> furtherFieldWriters) {
       DynamicType.Builder<ByteBuddyProto3FastMessageWriter> classBuilder =
-          new ByteBuddy().subclass(ByteBuddyProto3FastMessageWriter.class);
+          new ByteBuddy().subclass(ByteBuddyProto3FastMessageWriter.class)
+              .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$"
+                  + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet());
+
       FastMessageWriterWriteAllFieldsImplementation impl = new FastMessageWriterWriteAllFieldsImplementation(
+          protoWriteSupport,
           messageWriter,
           ReflectionUtil.getProto3MessageOrBuilderInterface(messageWriter.protoMessageClass)
               .get(),
@@ -1386,8 +1393,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               .intercept(impl);
 
       DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = writeAllFields
-          .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$"
-              + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet())
           .make();
 
       try {
@@ -1475,6 +1480,18 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           this.proto3MessageOrBuilderInterface = ReflectionUtil.getProto3MessageOrBuilderInterface(
                   (Class<?>) fieldWriter.getFieldReflectionType())
               .orElse(null);
+        }
+
+        FieldDescriptor fieldWriterDescriptor() {
+          return arrayWriter != null ? arrayWriter.fieldDescriptor : fieldWriter.fieldDescriptor;
+        }
+
+        String fieldWriterName() {
+          return arrayWriter != null ? arrayWriter.fieldName : fieldWriter.fieldName;
+        }
+
+        int fieldWriterIndex() {
+          return arrayWriter != null ? arrayWriter.index : fieldWriter.index;
         }
 
         Class<?> getReflectionType() {
@@ -1655,6 +1672,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
      * an implementation for {@link FastMessageWriter#writeAllFields(MessageOrBuilder)}
      */
     static class FastMessageWriterWriteAllFieldsImplementation implements Implementation {
+      final ProtoWriteSupport<?> protoWriteSupport;
       final ProtoWriteSupport<?>.MessageWriter rootMessageWriter;
       final TypeDescription typeDescription;
 
@@ -1664,9 +1682,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final Map<String, Implementation> writeAllFieldsMethods = new HashMap<>();
 
       FastMessageWriterWriteAllFieldsImplementation(
+          ProtoWriteSupport<?> protoWriteSupport,
           ProtoWriteSupport<?>.MessageWriter rootMessageWriter,
           Class<? extends MessageOrBuilder> rootProto3MessageOrBuilderInterface,
           TypeDescription typeDescription) {
+        this.protoWriteSupport = protoWriteSupport;
         this.rootMessageWriter = rootMessageWriter;
         this.typeDescription = typeDescription;
 
@@ -1688,8 +1708,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                   new WriteAllFieldsForMessageImplementation(
                       field.fieldPath,
                       (ProtoWriteSupport<?>.MessageWriter) field.fieldWriter,
-                      field.arrayWriter,
-                      field.proto3MessageOrBuilderInterface));
+                      field.arrayWriter, field.proto3MessageOrBuilderInterface));
             }
             return false;
           }
@@ -1699,6 +1718,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return false;
           }
         });
+      }
+
+      boolean unwrapProtoWrappers() {
+        return protoWriteSupport.unwrapProtoWrappers;
+      }
+
+      boolean writeSpecsCompliant() {
+        return protoWriteSupport.writeSpecsCompliant;
       }
 
       class WriteAllFieldsForMessageImplementation extends WritAllFieldsImplementation {
@@ -1759,10 +1786,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
       }
 
-      abstract static class WritAllFieldsImplementation implements Implementation {
-        final List<Implementation> steps = new ArrayList<>();
+      abstract class WritAllFieldsImplementation implements Implementation {
+        final Implementations steps = new Implementations();
         final LocalVars localVars = new LocalVars(steps);
-        final List<List<TypeDescription>> frames = new ArrayList<>();
 
         Implementation compound;
 
@@ -1794,17 +1820,17 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             localVars.frameEmptyStack();
 
             if (rootMessage) {
-              steps.add(returnFalseIfNotInstanceOf(messageOrBuilderArg, proto3MessageOrBuilderInterface));
+              steps.add(Codegen.returnFalseIfNotInstanceOf(messageOrBuilderArg, proto3MessageOrBuilderInterface));
             }
             try (LocalVar proto3MessageOrBuilder = rootMessage
                 ? localVars.register(proto3MessageOrBuilderInterface)
                 : messageOrBuilderArg.alias()) {
               if (rootMessage) {
-                steps.add(castToProto3MessageOrBuilderInterface(
+                steps.add(Codegen.castToProto3MessageOrBuilderInterface(
                     proto3MessageOrBuilder, messageOrBuilderArg, proto3MessageOrBuilderInterface));
               }
               try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
-                steps.add(storeRecordConsumer(recordConsumerVar));
+                steps.add(Codegen.storeRecordConsumer(recordConsumerVar));
 
                 writeMessageFieldsInternal(
                     proto3MessageOrBuilder,
@@ -1816,9 +1842,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             }
 
             if (rootMessage) {
-              steps.add(returnTrue());
+              steps.add(Codegen.returnTrue());
             } else {
-              steps.add(returnVoid());
+              steps.add(Codegen.returnVoid());
             }
           }
         }
@@ -1909,116 +1935,231 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             LocalVar recordConsumerVar,
             MessageWriterVisitor.RegularField field) {
           if (field.isRepeated()) {
-            return null;
+            return (new Implementations(){{
+              Label afterIfCountGreaterThanZero = new Label();
+              try (LocalVar countVar = localVars.register(int.class)) {
+                add(
+                    proto3MessageOrBuilder.load(),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}Count", field.fieldWriterDescriptor()),
+                    countVar.store(),
+                    countVar.load(),
+                    Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
+
+                    recordConsumerVar.load(),
+                    new TextConstant(field.fieldWriterName()),
+                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+                );
+
+                if (writeSpecsCompliant()) {
+                  add(
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                      recordConsumerVar.load(),
+                      new TextConstant("list"),
+                      IntegerConstant.forValue(0),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+                  );
+                }
+
+                Label nextIteration = new Label();
+                Label afterForLoop = new Label();
+                try (LocalVar iVar = localVars.register(int.class)) {
+                  add(
+                      IntegerConstant.forValue(0),
+                      iVar.store(),
+                      Codegen.visitLabel(nextIteration),
+                      localVars.frameEmptyStack(),
+                      iVar.load(),
+                      countVar.load(),
+                      Codegen.jumpTo(Opcodes.IF_ICMPGE, afterForLoop)
+                  );
+
+                  if (writeSpecsCompliant()) {
+                    add(
+                        recordConsumerVar.load(),
+                        Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                        recordConsumerVar.load(),
+                        new TextConstant("element"),
+                        IntegerConstant.forValue(0),
+                        Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+                    );
+                  }
+
+                  add(
+                      recordConsumerVar.load(),
+                      proto3MessageOrBuilder.load(),
+                      iVar.load(),
+                      Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.fieldWriterDescriptor(), int.class),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.fieldWriter.getFieldReflectionType()))
+                  );
+
+
+                  if (writeSpecsCompliant()) {
+                    add(
+                        recordConsumerVar.load(),
+                        new TextConstant("element"),
+                        IntegerConstant.forValue(0),
+                        Codegen.invokeMethod(Reflection.RecordConsumer.endField),
+                        recordConsumerVar.load(),
+                        Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+                    );
+                  }
+
+                  add(
+                      Codegen.incIntVar(iVar, 1),
+                      Codegen.jumpTo(Opcodes.GOTO, nextIteration)
+                  );
+                }
+
+                add(
+                    Codegen.visitLabel(afterForLoop),
+                    localVars.frameEmptyStack()
+                );
+
+
+                if (writeSpecsCompliant()) {
+                  add(
+                      recordConsumerVar.load(),
+                      new TextConstant("list"),
+                      IntegerConstant.forValue(0),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endField),
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+                  );
+                }
+
+                add(
+                    recordConsumerVar.load(),
+                    new TextConstant(field.fieldWriterName()),
+                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.endField)
+                );
+              }
+              add(
+                  Codegen.visitLabel(afterIfCountGreaterThanZero),
+                  localVars.frameEmptyStack()
+              );
+            }});
           } else {
             Label afterEndField = new Label();
-            return toImplementation(
-                field.isOptional()
-                    ? new StackManipulation.Compound(
-                        proto3MessageOrBuilder.load(),
-                        MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(
-                            ReflectionUtil.getDeclaredMethod(
-                                proto3MessageOrBuilder.clazz(),
-                                "has{}",
-                                field.fieldWriter.fieldDescriptor))),
-                        new StackManipulation.AbstractBase() {
-                          @Override
-                          public Size apply(
-                              MethodVisitor methodVisitor,
-                              Context implementationContext) {
-                            methodVisitor.visitJumpInsn(Opcodes.IFEQ, afterEndField);
-                            return Size.ZERO;
-                          }
-                        })
-                    : StackManipulation.Trivial.INSTANCE,
-                recordConsumerVar.load(),
-                new TextConstant(field.fieldWriter.fieldName),
-                IntegerConstant.forValue(field.fieldWriter.index),
-                MethodInvocation.invoke(
-                    new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.startField)),
-                recordConsumerVar.load(),
-                proto3MessageOrBuilder.load(),
-                MethodInvocation.invoke(
-                    new MethodDescription.ForLoadedMethod(ReflectionUtil.getDeclaredMethod(
-                        proto3MessageOrBuilder.clazz(),
-                        "get{}",
-                        field.fieldWriter.fieldDescriptor))),
-                MethodInvocation.invoke(
-                    new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.PRIMITIVES.get(
-                        field.fieldWriter.getFieldReflectionType()))),
-                recordConsumerVar.load(),
-                new TextConstant(field.fieldWriter.fieldName),
-                IntegerConstant.forValue(field.fieldWriter.index),
-                MethodInvocation.invoke(
-                    new MethodDescription.ForLoadedMethod(Reflection.RecordConsumer.endField)),
-                field.isOptional()
-                    ? new StackManipulation.Compound(
-                        new StackManipulation.AbstractBase() {
-                          @Override
-                          public Size apply(
-                              MethodVisitor methodVisitor,
-                              Context implementationContext) {
-                            methodVisitor.visitLabel(afterEndField);
-                            return Size.ZERO;
-                          }
-                        },
-                        localVars.frameEmptyStack())
-                    : StackManipulation.Trivial.INSTANCE);
+            return new Implementations() {{
+              if (field.isOptional()) {
+                add(proto3MessageOrBuilder.load(),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "has{}", field.fieldWriter.fieldDescriptor),
+                    Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
+              }
+
+              add(recordConsumerVar.load(),
+                  new TextConstant(field.fieldWriter.fieldName),
+                  IntegerConstant.forValue(field.fieldWriter.index),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startField),
+                  recordConsumerVar.load(),
+                  proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.fieldWriter.fieldDescriptor),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.fieldWriter.getFieldReflectionType())),
+                  recordConsumerVar.load(),
+                  new TextConstant(field.fieldWriter.fieldName),
+                  IntegerConstant.forValue(field.fieldWriter.index),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endField));
+
+              if (field.isOptional()) {
+                add(Codegen.visitLabel(afterEndField),
+                    localVars.frameEmptyStack());
+              }
+            }};
           }
         }
+      }
 
-        protected static Implementation returnTrue() {
+      static class Codegen {
+        private static StackManipulation incIntVar(LocalVar var, int inc) {
+          int offset = var.offset();
+          return new StackManipulation.AbstractBase() {
+            @Override
+            public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+              methodVisitor.visitIincInsn(offset, inc);
+              return Size.ZERO;
+            }
+          };
+        }
+
+        private static StackManipulation jumpTo(int jumpInst, Label label) {
+          return new StackManipulation.AbstractBase() {
+            @Override
+            public Size apply(
+                MethodVisitor methodVisitor,
+                Context implementationContext) {
+              methodVisitor.visitJumpInsn(jumpInst, label);
+              return Size.ZERO;
+            }
+          };
+        }
+
+        private static StackManipulation visitLabel(Label label) {
+          return new StackManipulation.AbstractBase() {
+            @Override
+            public Size apply(
+                MethodVisitor methodVisitor,
+                Context implementationContext) {
+              methodVisitor.visitLabel(label);
+              return Size.ZERO;
+            }
+          };
+        }
+
+        private static Implementation returnTrue() {
           return FixedValue.value(true);
         }
 
-        protected static Implementation returnVoid() {
-          return toImplementation(MethodReturn.VOID);
+        private static Implementation returnFalse() {
+          return FixedValue.value(false);
         }
 
-        protected Implementation storeRecordConsumer(LocalVar recordConsumerVar) {
-          return toImplementation(
+        private static Implementation returnVoid() {
+          return new Implementations(MethodReturn.VOID);
+        }
+
+        private static StackManipulation invokeMethod(Method method) {
+          return MethodInvocation.invoke(
+              new MethodDescription.ForLoadedMethod(method));
+        }
+
+        private static StackManipulation invokeProtoMethod(Class<?> proto3MessageOrBuilderInterface,
+                                                    String name,
+                                                    FieldDescriptor fieldDescriptor,
+                                                    Class<?>... parameters) {
+          return invokeMethod(ReflectionUtil.getDeclaredMethod(proto3MessageOrBuilderInterface, name, fieldDescriptor, parameters));
+        }
+
+        private static Implementation storeRecordConsumer(LocalVar recordConsumerVar) {
+          return new Implementations(
               MethodVariableAccess.loadThis(),
-              MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(
-                  Reflection.ByteBuddyProto3FastMessageWriter.getRecordConsumer)),
-              MethodVariableAccess.REFERENCE.storeAt(recordConsumerVar.offset()));
+              invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.getRecordConsumer),
+              recordConsumerVar.store());
         }
 
-        protected Implementation castToProto3MessageOrBuilderInterface(
+        private static Implementation castToProto3MessageOrBuilderInterface(
             LocalVar dest,
             LocalVar src,
             Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          return toImplementation(
+          return new Implementations(
               src.load(),
-              //                   MethodVariableAccess.REFERENCE.loadFrom(src.offset()),
               TypeCasting.to(TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface)),
-              dest.store()
-              //                   MethodVariableAccess.REFERENCE.storeAt(dest.offset())
-              );
+              dest.store());
         }
 
-        protected Implementation returnFalseIfNotInstanceOf(LocalVar var, Class<?> clazz) {
-          int varOffset = var.offset();
-          //           List<TypeDescription> types = localVars.types();
-          return toImplementation(
-              new StackManipulation.AbstractBase() {
-                @Override
-                public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
-                  methodVisitor.visitVarInsn(Opcodes.ALOAD, varOffset);
-                  methodVisitor.visitTypeInsn(
-                      Opcodes.INSTANCEOF,
-                      TypeDescription.ForLoadedType.of(clazz)
-                          .getInternalName());
-                  Label afterInstanceOf = new Label();
-                  methodVisitor.visitJumpInsn(Opcodes.IFNE, afterInstanceOf);
-                  methodVisitor.visitInsn(Opcodes.ICONST_0);
-                  methodVisitor.visitInsn(Opcodes.IRETURN);
-                  methodVisitor.visitLabel(afterInstanceOf);
-                  //               implementationContext.getFrameGeneration().same(methodVisitor,
-                  // types);
-                  return Size.ZERO;
-                }
-              },
-              localVars.frameEmptyStack());
+        private static Implementation returnFalseIfNotInstanceOf(LocalVar var, Class<?> clazz) {
+          return new Implementations(){{
+            Label afterInstanceOf = new Label();
+            add(var.load(),
+                InstanceCheck.of(TypeDescription.ForLoadedType.of(clazz)),
+                jumpTo(Opcodes.IFNE, afterInstanceOf)
+            );
+            add(returnFalse());
+            add(visitLabel(afterInstanceOf),
+                var.vars().frameEmptyStack());
+          }};
         }
       }
 
@@ -2050,16 +2191,71 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         return instrumentedType;
       }
 
-      protected static Implementation toImplementation(Implementation... implementations) {
-        return new Implementation.Compound(implementations);
+      static class Implementations implements Implementation {
+        final List<Implementation> implementations = new ArrayList<>();
+
+        Implementation compound;
+
+        Implementations(){}
+
+        Implementations(Implementation... implementations) {
+          add(implementations);
+        }
+
+        Implementations(ByteCodeAppender... appenders) {
+          add(appenders);
+        }
+
+        Implementations(StackManipulation... stackManipulations) {
+          add(stackManipulations);
+        }
+
+        @Override
+        public ByteCodeAppender appender(Target implementationTarget) {
+          return compound.appender(implementationTarget);
+        }
+
+        @Override
+        public InstrumentedType prepare(InstrumentedType instrumentedType) {
+          if (compound != null) {
+            throw new IllegalStateException();
+          }
+          compound = new Implementation.Compound(implementations);
+          return compound.prepare(instrumentedType);
+        }
+
+        public Implementations add(Implementation... implementations) {
+          this.implementations.addAll(Arrays.asList(implementations));
+          return this;
+        }
+
+        public Implementations add(ByteCodeAppender... appenders) {
+          return add(new Implementation.Simple(appenders));
+        }
+
+        public Implementations add(StackManipulation... stackManipulations) {
+          return add(new Implementation.Simple(stackManipulations));
+        }
       }
 
-      protected static Implementation toImplementation(ByteCodeAppender... appenders) {
-        return new Implementation.Simple(appenders);
-      }
+      static class StackManipulations extends StackManipulation.AbstractBase {
+        final List<StackManipulation> stackManipulations = new ArrayList<>();
 
-      protected static Implementation toImplementation(StackManipulation... stackManipulations) {
-        return new Implementation.Simple(stackManipulations);
+        StackManipulations() {}
+
+        StackManipulations(StackManipulation... stackManipulations) {
+          add(stackManipulations);
+        }
+
+        @Override
+        public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+          return new StackManipulation.Compound(stackManipulations).apply(methodVisitor, implementationContext);
+        }
+
+        public StackManipulations add(StackManipulation ... stackManipulations) {
+          this.stackManipulations.addAll(Arrays.asList(stackManipulations));
+          return this;
+        }
       }
 
       static class LocalVar implements AutoCloseable {
@@ -2151,28 +2347,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           unregister();
         }
 
-        public List<TypeDescription> typesBefore() {
-          int index = assertRegistered();
-          List<TypeDescription> types = new ArrayList<>();
-          List<LocalVar> localVars = vars.vars;
-          for (int i = 0; i < index; i++) {
-            LocalVar var = localVars.get(i);
-            types.add(var.typeDescription);
-          }
-          return types;
-        }
-
-        public List<TypeDescription> typesFrom() {
-          int index = assertRegistered();
-          List<TypeDescription> types = new ArrayList<>();
-          List<LocalVar> localVars = vars.vars;
-          for (int i = index; i < localVars.size(); i++) {
-            LocalVar var = localVars.get(i);
-            types.add(var.typeDescription);
-          }
-          return types;
-        }
-
         @Override
         public String toString() {
           return "LocalVar{" + "vars="
@@ -2184,11 +2358,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       static class LocalVars {
-        final List<Implementation> steps;
+        final Implementations steps;
         final List<TypeDescription> frame = new ArrayList<>();
         List<LocalVar> vars = new ArrayList<>();
 
-        LocalVars(List<Implementation> steps) {
+        LocalVars(Implementations steps) {
           this.steps = steps;
         }
 
@@ -2312,7 +2486,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         Implementation asImplementation() {
           int size = getSize();
-          return toImplementation(new ByteCodeAppender() {
+          return new Implementations(new ByteCodeAppender() {
             @Override
             public Size apply(
                 MethodVisitor methodVisitor,
