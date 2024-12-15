@@ -66,6 +66,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.IntFunction;
 import java.util.stream.Stream;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.description.method.MethodDescription;
@@ -331,8 +332,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
   class MessageWriter extends FieldWriter {
 
     final FieldWriter[] fieldWriters;
+    final Class<? extends Message> protoMessageClass;
+
     FastMessageWriter fastMessageWriter = FastMessageWriter.NOOP;
-    Class<? extends Message> protoMessageClass;
 
     @SuppressWarnings("unchecked")
     MessageWriter(Descriptor descriptor, GroupType schema, Class<? extends Message> protoMessageClass) {
@@ -368,6 +370,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     @Override
     Class<? extends Message> getFieldReflectionType() {
       return protoMessageClass;
+    }
+
+    Optional<? extends Class<? extends MessageOrBuilder>> getProto3MessageOrBuilderInterface() {
+      return ReflectionUtil.getProto3MessageOrBuilderInterface(protoMessageClass);
     }
 
     private FieldWriter createWriter(
@@ -496,6 +502,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       FieldWriter keyWriter = createWriter(keyProtoField, type, mapReflectionType.getKey());
       keyWriter.setFieldName(keyProtoField.getName());
       keyWriter.setIndex(0);
+      keyWriter.setFieldDescriptor(keyProtoField);
 
       // ValueFieldWriter
       FieldDescriptor valueProtoField = fields.get(1);
@@ -505,6 +512,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           mapReflectionType.getValue());
       valueWriter.setFieldName(valueProtoField.getName());
       valueWriter.setIndex(1);
+      valueWriter.setFieldDescriptor(valueProtoField);
 
       return new MapWriter(keyWriter, valueWriter, mapReflectionType);
     }
@@ -1455,143 +1463,145 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
       }
 
-      abstract class Field {
+      abstract class Field<T extends ProtoWriteSupport<?>.FieldWriter> {
         final FieldPath fieldPath;
+        final Class<? extends Message> owningType;
+        final T fieldWriter;
 
-        Field(FieldPath fieldPath) {
+        Field(FieldPath fieldPath, Class<? extends Message> owningType, T fieldWriter) {
           this.fieldPath = fieldPath;
+          this.owningType = owningType;
+          this.fieldWriter = fieldWriter;
+        }
+
+        Optional<? extends Class<? extends MessageOrBuilder>> getOwningTypeProto3MessageOrBuilderInterface() {
+          return ReflectionUtil.getProto3MessageOrBuilderInterface(owningType);
         }
       }
 
-      class RegularField extends Field {
-        final ProtoWriteSupport<?>.FieldWriter fieldWriter;
-        final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-        final Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface;
-
+      class RegularField<T extends ProtoWriteSupport<?>.FieldWriter> extends Field<T> {
         RegularField(
             FieldPath fieldPath,
-            ProtoWriteSupport<?>.FieldWriter fieldWriter,
-            ProtoWriteSupport<?>.ArrayWriter arrayWriter) {
-          super(fieldPath);
-          this.fieldWriter = fieldWriter;
-          this.arrayWriter = arrayWriter;
-          this.proto3MessageOrBuilderInterface = ReflectionUtil.getProto3MessageOrBuilderInterface(
-                  (Class<?>) fieldWriter.getFieldReflectionType())
-              .orElse(null);
+            Class<? extends Message> owningType,
+            T fieldWriter) {
+          super(fieldPath, owningType, fieldWriter);
         }
 
-        FieldDescriptor fieldWriterDescriptor() {
-          return arrayWriter != null ? arrayWriter.fieldDescriptor : fieldWriter.fieldDescriptor;
+        ProtoWriteSupport<?>.FieldWriter rawValueWriter() {
+          if (fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter) {
+            return ((ProtoWriteSupport<?>.ArrayWriter) fieldWriter).fieldWriter;
+          }
+          return fieldWriter;
         }
 
-        String fieldWriterName() {
-          return arrayWriter != null ? arrayWriter.fieldName : fieldWriter.fieldName;
+        RegularField<? extends ProtoWriteSupport<?>.MessageWriter> asRawValueMessageWriter() {
+          if (!isMessage()) {
+            throw new IllegalStateException();
+          }
+          return new RegularField<>(fieldPath, owningType, (ProtoWriteSupport<?>.MessageWriter) rawValueWriter());
         }
 
-        int fieldWriterIndex() {
-          return arrayWriter != null ? arrayWriter.index : fieldWriter.index;
+        boolean isRoot() {
+          return fieldPath.isRoot();
         }
 
-        Class<?> getReflectionType() {
-          return (Class<?>) fieldWriter.getFieldReflectionType();
+        FieldDescriptor protoDescriptor() {
+          return fieldWriter.fieldDescriptor;
+        }
+
+        String parquetFieldName() {
+          return fieldWriter.fieldName;
+        }
+
+        int parquetFieldIndex() {
+          return fieldWriter.index;
+        }
+
+        Class<?> getFieldReflectionType() {
+          return (Class<?>) rawValueWriter().getFieldReflectionType();
+        }
+
+        Optional<? extends Class<? extends MessageOrBuilder>> getFieldReflectionTypeProto3MessageOrBuilderInterface() {
+          if (!isMessage()) {
+            throw new IllegalStateException("illegal to call on non-message field");
+          }
+          return ReflectionUtil.getProto3MessageOrBuilderInterface(
+              (Class<?>) rawValueWriter().getFieldReflectionType()
+          );
         }
 
         boolean isRepeated() {
-          return arrayWriter != null;
+          return fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter;
         }
 
         boolean isOptional() {
-          return fieldWriter.fieldDescriptor.hasPresence();
+          if (isRepeated()) {
+            return false;
+          }
+          return protoDescriptor().hasPresence();
         }
 
         boolean isPrimitive() {
-          return fieldWriter instanceof JavaPrimitiveWriter;
+          return rawValueWriter() instanceof JavaPrimitiveWriter;
         }
 
         boolean isProtoWrapper() {
-          return fieldWriter instanceof WrappersProtoWriter;
+          return rawValueWriter() instanceof WrappersProtoWriter;
         }
 
         boolean isMessage() {
-          return fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter;
+          return rawValueWriter() instanceof ProtoWriteSupport<?>.MessageWriter;
         }
 
         boolean isString() {
-          return fieldWriter instanceof ProtoWriteSupport<?>.StringWriter;
+          return rawValueWriter() instanceof ProtoWriteSupport<?>.StringWriter;
         }
 
         boolean isBinary() {
-          return fieldWriter instanceof ProtoWriteSupport<?>.BinaryWriter;
+          return rawValueWriter() instanceof ProtoWriteSupport<?>.BinaryWriter;
         }
 
         boolean isBinaryMessage() {
-          return fieldWriter instanceof ProtoWriteSupport<?>.BinaryMessageWriter;
+          return rawValueWriter() instanceof ProtoWriteSupport<?>.BinaryMessageWriter;
+        }
+
+        boolean isEnum() {
+          return rawValueWriter() instanceof ProtoWriteSupport<?>.EnumWriter;
         }
       }
 
-      class MapField extends Field {
-        final ProtoWriteSupport<?>.MapWriter mapWriter;
-        final Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface;
-
-        MapField(FieldPath fieldPath, ProtoWriteSupport<?>.MapWriter mapWriter) {
-          super(fieldPath);
-          this.mapWriter = mapWriter;
-          this.proto3MessageOrBuilderInterface = ReflectionUtil.getProto3MessageOrBuilderInterface(
-                  (Class<?>) mapWriter.valueWriter.getFieldReflectionType())
-              .orElse(null);
+      class MapField extends Field<ProtoWriteSupport<?>.MapWriter> {
+        MapField(FieldPath fieldPath, Class<? extends Message> owningType, ProtoWriteSupport<?>.MapWriter mapWriter) {
+          super(fieldPath, owningType, mapWriter);
         }
 
-        Class<?> getKeyReflectionType() {
-          return (Class<?>) mapWriter.keyWriter.getFieldReflectionType();
+        RegularField<ProtoWriteSupport<?>.FieldWriter> key() {
+          return new RegularField<>(fieldPath.push("key"), owningType, fieldWriter.keyWriter);
         }
 
-        Class<?> getValueReflectionType() {
-          return (Class<?>) mapWriter.valueWriter.getFieldReflectionType();
-        }
-
-        boolean isPrimitive() {
-          return mapWriter.valueWriter instanceof JavaPrimitiveWriter;
-        }
-
-        boolean isProtoWrapper() {
-          return mapWriter.valueWriter instanceof WrappersProtoWriter;
-        }
-
-        boolean isMessage() {
-          return mapWriter.valueWriter instanceof ProtoWriteSupport<?>.MessageWriter;
-        }
-
-        boolean isString() {
-          return mapWriter.valueWriter instanceof ProtoWriteSupport<?>.StringWriter;
-        }
-
-        boolean isBinary() {
-          return mapWriter.valueWriter instanceof ProtoWriteSupport<?>.BinaryWriter;
-        }
-
-        boolean isBinaryMessage() {
-          return mapWriter.valueWriter instanceof ProtoWriteSupport<?>.BinaryMessageWriter;
+        RegularField<ProtoWriteSupport<?>.FieldWriter> value() {
+          return new RegularField<>(fieldPath.push("value"), owningType, fieldWriter.valueWriter);
         }
       }
 
-      default boolean visitMessageField(RegularField field) {
-        return ReflectionUtil.getProto3MessageOrBuilderInterface(field.getReflectionType())
+      default boolean visitMessageWriter(RegularField<?> field) {
+        return ReflectionUtil.getProto3MessageOrBuilderInterface(field.getFieldReflectionType())
             .isPresent();
       }
 
-      default void visitNonMessageField(RegularField field) {}
+      default void visitNonMessageWriter(RegularField<?> field) {}
 
-      default boolean visitMapMessageField(MapField field) {
-        return ReflectionUtil.getProto3MessageOrBuilderInterface(field.getValueReflectionType())
-            .isPresent();
+      default boolean visitMapMessageWriter(MapField field) {
+        return field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
       }
 
-      default void visitMapNonMessageField(MapField field) {}
+      default void visitMapNonMessageWriter(MapField field) {}
 
-      static void traverse(
-          FieldPath fieldPath,
-          ProtoWriteSupport<?>.MessageWriter messageWriter,
-          MessageWriterVisitor visitor) {
+      static void traverse(RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start, MessageWriterVisitor visitor) {
+        if (!start.isMessage()) {
+          throw new IllegalStateException("start must be message");
+        }
+
         class FieldPathAndMessageWriter {
           final FieldPath fieldPath;
           final ProtoWriteSupport<?>.MessageWriter messageWriter;
@@ -1605,58 +1615,53 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         class Traverse {
           void traverse() {
             Queue<FieldPathAndMessageWriter> queue = new LinkedList<>();
-            queue.add(new FieldPathAndMessageWriter(fieldPath, messageWriter));
+            visitField(start, queue);
             while (!queue.isEmpty()) {
               FieldPathAndMessageWriter next = queue.poll();
+              Class<? extends Message> owningType = next.messageWriter.getFieldReflectionType();
+
               for (ProtoWriteSupport<?>.FieldWriter fieldWriter : next.messageWriter.fieldWriters) {
-                if (fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter) {
-                  ProtoWriteSupport<?>.ArrayWriter arrayWriter =
-                      (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-                  visitField(
-                      next.fieldPath.push(fieldWriter.fieldName),
-                      arrayWriter.fieldWriter,
-                      arrayWriter,
-                      queue);
-                } else if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-                  visitMap(
-                      next.fieldPath.push(fieldWriter.fieldName),
-                      (ProtoWriteSupport<?>.MapWriter) fieldWriter,
-                      queue);
+                FieldPath field = next.fieldPath.push(fieldWriter.fieldName);
+                if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
+                  MapField mapField = new MapField(
+                      field,
+                      owningType,
+                      (ProtoWriteSupport<?>.MapWriter) fieldWriter);
+                  visitMap(mapField, queue);
                 } else {
-                  visitField(next.fieldPath.push(fieldWriter.fieldName), fieldWriter, null, queue);
+                  RegularField<?> regularField = new RegularField<>(
+                      field,
+                      owningType,
+                      fieldWriter
+                  );
+                  visitField(regularField, queue);
                 }
               }
             }
           }
 
-          void visitField(
-              FieldPath fieldPath,
-              ProtoWriteSupport<?>.FieldWriter fieldWriter,
-              ProtoWriteSupport<?>.ArrayWriter arrayWriter,
-              Queue<FieldPathAndMessageWriter> queue) {
-            if (fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-              if (visitor.visitMessageField(new RegularField(fieldPath, fieldWriter, arrayWriter))) {
+          void visitField(RegularField<?> regularField, Queue<FieldPathAndMessageWriter> queue) {
+            if (regularField.isMessage()) {
+              if (visitor.visitMessageWriter(regularField)) {
                 queue.add(new FieldPathAndMessageWriter(
-                    fieldPath,
-                    (ProtoWriteSupport<?>.MessageWriter) fieldWriter));
+                    regularField.fieldPath,
+                    (ProtoWriteSupport<?>.MessageWriter) regularField.rawValueWriter()));
               }
             } else {
-              visitor.visitNonMessageField(new RegularField(fieldPath, fieldWriter, arrayWriter));
+              visitor.visitNonMessageWriter(regularField);
             }
           }
 
-          void visitMap(
-              FieldPath fieldPath,
-              ProtoWriteSupport<?>.MapWriter mapWriter,
-              Queue<FieldPathAndMessageWriter> queue) {
-            if (mapWriter.valueWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-              if (visitor.visitMapMessageField(new MapField(fieldPath, mapWriter))) {
+          void visitMap(MapField mapField, Queue<FieldPathAndMessageWriter> queue) {
+            RegularField<?> valueField = mapField.value();
+            if (valueField.isMessage()) {
+              if (visitor.visitMapMessageWriter(mapField)) {
                 queue.add(new FieldPathAndMessageWriter(
-                    fieldPath,
-                    (ProtoWriteSupport<?>.MessageWriter) mapWriter.valueWriter));
+                    mapField.fieldPath,
+                    (ProtoWriteSupport<?>.MessageWriter) mapField.fieldWriter.valueWriter));
               }
             } else {
-              visitor.visitMapNonMessageField(new MapField(fieldPath, mapWriter));
+              visitor.visitMapNonMessageWriter(mapField);
             }
           }
         }
@@ -1701,50 +1706,43 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         this.rootMessageWriter = rootMessageWriter;
         this.typeDescription = typeDescription;
 
-        FieldPath rootFieldPath = new FieldPath();
-        String rootMethodName = newWriteAllFieldsForMessageMethod(rootFieldPath, rootProto3MessageOrBuilderInterface);
+        MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start = new MessageWriterVisitor.RegularField<>(
+            new FieldPath(), null, rootMessageWriter);
 
-        MessageWriterVisitor.traverse(rootFieldPath, rootMessageWriter, new MessageWriterVisitor() {
+        MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
           @Override
-          public boolean visitMessageField(RegularField field) {
-            if (field.proto3MessageOrBuilderInterface == null) {
+          public boolean visitMessageWriter(RegularField<?> field) {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              registerWriteAllFieldsForMessageMethod(field);
+              return true;
+            } else {
               notOptimizedMessageWriters.add((ProtoWriteSupport<?>.MessageWriter) field.fieldWriter);
               return false;
-            } else {
-              newWriteAllFieldsForMessageMethod(field.fieldPath, field.proto3MessageOrBuilderInterface);
-              return true;
             }
           }
 
           @Override
-          public boolean visitMapMessageField(MapField field) {
+          public boolean visitMapMessageWriter(MapField field) {
             return false;
           }
         });
 
-        writeAllFieldsMethods.put(
-            rootMethodName,
-            new WriteAllFieldsForMessageImplementation(
-                rootFieldPath, rootMessageWriter, null, rootProto3MessageOrBuilderInterface));
-
-        MessageWriterVisitor.traverse(rootFieldPath, rootMessageWriter, new MessageWriterVisitor() {
+        MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
           @Override
-          public boolean visitMessageField(RegularField field) {
-            if (field.proto3MessageOrBuilderInterface == null) {
-              return false;
-            } else {
+          public boolean visitMessageWriter(RegularField<?> field) {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
               writeAllFieldsMethods.put(
                   fieldPathToMethodName.get(field.fieldPath),
-                  new WriteAllFieldsForMessageImplementation(
-                      field.fieldPath,
-                      (ProtoWriteSupport<?>.MessageWriter) field.fieldWriter,
-                      field.arrayWriter, field.proto3MessageOrBuilderInterface));
+                  new WriteAllFieldsForMessageImplementation(field.asRawValueMessageWriter())
+              );
               return true;
+            } else {
+              return false;
             }
           }
 
           @Override
-          public boolean visitMapMessageField(MapField field) {
+          public boolean visitMapMessageWriter(MapField field) {
             return false;
           }
         });
@@ -1759,30 +1757,20 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       class WriteAllFieldsForMessageImplementation extends WritAllFieldsImplementation {
-        final FieldPath fieldPath;
-        final ProtoWriteSupport<?>.MessageWriter fieldWriter;
-        final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-        final Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface;
+        final MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> field;
 
-        WriteAllFieldsForMessageImplementation(
-            FieldPath fieldPath,
-            ProtoWriteSupport<?>.MessageWriter fieldWriter,
-            ProtoWriteSupport<?>.ArrayWriter arrayWriter,
-            Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          this.fieldPath = fieldPath;
-          this.fieldWriter = fieldWriter;
-          this.arrayWriter = arrayWriter;
-          this.proto3MessageOrBuilderInterface = proto3MessageOrBuilderInterface;
+        WriteAllFieldsForMessageImplementation(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> regularField) {
+          this.field = regularField;
 
           try (LocalVar thisLocalVar = localVars.register(typeDescription)) {
-            writeMessageFields(fieldPath, fieldWriter, proto3MessageOrBuilderInterface);
+            writeMessageFields(regularField);
           }
         }
 
         @Override
         protected InstrumentedType registerMethod(InstrumentedType instrumentedType) {
-          if (!fieldPath.path.isEmpty()) {
-            instrumentedType = instrumentedType.withMethod(fieldPathToMethodDescriptionToken.get(fieldPath));
+          if (!field.fieldPath.isRoot()) {
+            instrumentedType = instrumentedType.withMethod(fieldPathToMethodDescriptionToken.get(field.fieldPath));
           }
           return instrumentedType;
         }
@@ -1835,11 +1823,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         protected abstract InstrumentedType registerMethod(InstrumentedType instrumentedType);
 
-        protected void writeMessageFields(
-            FieldPath fieldPath,
-            ProtoWriteSupport<?>.MessageWriter messageWriter,
-            Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          boolean rootMessage = fieldPath.isRoot();
+        protected void writeMessageFields(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> regularField) {
+          boolean rootMessage = regularField.isRoot();
+          Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface = regularField.getFieldReflectionTypeProto3MessageOrBuilderInterface().get();
 
           try (LocalVar messageOrBuilderArg = localVars.register(
               rootMessage ? MessageOrBuilder.class : proto3MessageOrBuilderInterface)) {
@@ -1862,9 +1848,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 writeMessageFieldsInternal(
                     proto3MessageOrBuilder,
                     recordConsumerVar,
-                    fieldPath,
-                    messageWriter,
-                    proto3MessageOrBuilderInterface);
+                    regularField);
               }
             }
 
@@ -1879,23 +1863,19 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         protected void writeMessageFieldsInternal(
             LocalVar proto3MessageOrBuilder,
             LocalVar recordConsumerVar,
-            FieldPath fieldPath,
-            ProtoWriteSupport<?>.MessageWriter messageWriter,
-            Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
+            MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start) {
 
-          MessageWriterVisitor.traverse(fieldPath, messageWriter, new MessageWriterVisitor() {
+          MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
             @Override
-            public boolean visitMessageField(RegularField field) {
+            public boolean visitMessageWriter(RegularField<?> field) {
+              if (field == start) {
+                return true;
+              }
               Implementation implementation =  writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
               if (implementation == null) {
                 JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                        field.arrayWriter != null
-                            ? field.arrayWriter.fieldDescriptor
-                            : field.fieldWriter.fieldDescriptor,
-                        proto3MessageOrBuilderInterface);
-                fieldOfObjectWriter.setFieldWriter(
-                    field.arrayWriter != null ? field.arrayWriter : field.fieldWriter);
+                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
+                        field.fieldWriter);
 
                 implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
                     .on(fieldOfObjectWriter)
@@ -1907,20 +1887,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             }
 
             @Override
-            public void visitNonMessageField(RegularField field) {
+            public void visitNonMessageWriter(RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
               Implementation implementation = null;
               if (field.isPrimitive()) {
                 implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
               }
               if (implementation == null) {
                 JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                        field.arrayWriter != null
-                            ? field.arrayWriter.fieldDescriptor
-                            : field.fieldWriter.fieldDescriptor,
-                        proto3MessageOrBuilderInterface);
-                fieldOfObjectWriter.setFieldWriter(
-                    field.arrayWriter != null ? field.arrayWriter : field.fieldWriter);
+                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
+                        field.fieldWriter);
 
                 implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
                     .on(fieldOfObjectWriter)
@@ -1931,11 +1906,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             }
 
             @Override
-            public boolean visitMapMessageField(MapField field) {
+            public boolean visitMapMessageWriter(MapField field) {
               JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                      field.mapWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
-              fieldOfObjectWriter.setFieldWriter(field.mapWriter);
+                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
+                      field.fieldWriter);
 
               steps.add(MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
                   .on(fieldOfObjectWriter)
@@ -1946,11 +1920,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             }
 
             @Override
-            public void visitMapNonMessageField(MapField field) {
+            public void visitMapNonMessageWriter(MapField field) {
               JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                      field.mapWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
-              fieldOfObjectWriter.setFieldWriter(field.mapWriter);
+                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
+                      field.fieldWriter);
 
               steps.add(MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
                   .on(fieldOfObjectWriter)
@@ -1963,21 +1936,21 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         private Implementation writePrimitiveField(
             LocalVar proto3MessageOrBuilder,
             LocalVar recordConsumerVar,
-            MessageWriterVisitor.RegularField field) {
+            MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
           if (field.isRepeated()) {
             return (new Implementations(){{
               Label afterIfCountGreaterThanZero = new Label();
               try (LocalVar countVar = localVars.register(int.class)) {
                 add(
                     proto3MessageOrBuilder.load(),
-                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}Count", field.fieldWriterDescriptor()),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}Count", field.protoDescriptor()),
                     countVar.store(),
                     countVar.load(),
                     Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
 
                     recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriterName()),
-                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
                     Codegen.invokeMethod(Reflection.RecordConsumer.startField)
                 );
 
@@ -2020,8 +1993,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                       recordConsumerVar.load(),
                       proto3MessageOrBuilder.load(),
                       iVar.load(),
-                      Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.fieldWriterDescriptor(), int.class),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.fieldWriter.getFieldReflectionType()))
+                      Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor(), int.class),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.getFieldReflectionType()))
                   );
 
 
@@ -2061,8 +2034,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
                 add(
                     recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriterName()),
-                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
                     Codegen.invokeMethod(Reflection.RecordConsumer.endField)
                 );
               }
@@ -2076,7 +2049,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return new Implementations() {{
               if (field.isOptional()) {
                 add(proto3MessageOrBuilder.load(),
-                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "has{}", field.fieldWriter.fieldDescriptor),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "has{}", field.protoDescriptor()),
                     Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
               }
 
@@ -2086,8 +2059,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                   Codegen.invokeMethod(Reflection.RecordConsumer.startField),
                   recordConsumerVar.load(),
                   proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.fieldWriter.fieldDescriptor),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.fieldWriter.getFieldReflectionType())),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor()),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.getFieldReflectionType())),
                   recordConsumerVar.load(),
                   new TextConstant(field.fieldWriter.fieldName),
                   IntegerConstant.forValue(field.fieldWriter.index),
@@ -2104,8 +2077,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         private Implementation writeMessageField(
             LocalVar proto3MessageOrBuilder,
             LocalVar recordConsumerVar,
-            MessageWriterVisitor.RegularField field) {
-          if (field.proto3MessageOrBuilderInterface == null || field.isBinaryMessage()) {
+            MessageWriterVisitor.RegularField<?> field) {
+          if (!field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
             return null;
           }
           if (field.isRepeated()) {
@@ -2114,14 +2087,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               try (LocalVar countVar = localVars.register(int.class)) {
                 add(
                     proto3MessageOrBuilder.load(),
-                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}Count", field.fieldWriterDescriptor()),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}Count", field.protoDescriptor()),
                     countVar.store(),
                     countVar.load(),
                     Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
 
                     recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriterName()),
-                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
                     Codegen.invokeMethod(Reflection.RecordConsumer.startField)
                 );
 
@@ -2166,7 +2139,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                       MethodVariableAccess.loadThis(),
                       proto3MessageOrBuilder.load(),
                       iVar.load(),
-                      Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}OrBuilder", field.fieldWriterDescriptor(), int.class),
+                      Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}OrBuilder", field.protoDescriptor(), int.class),
                       MethodInvocation.invoke(fieldPathToMethodDescription.get(field.fieldPath)),
                       recordConsumerVar.load(),
                       Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
@@ -2209,8 +2182,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
                 add(
                     recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriterName()),
-                    IntegerConstant.forValue(field.fieldWriterIndex()),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
                     Codegen.invokeMethod(Reflection.RecordConsumer.endField)
                 );
               }
@@ -2224,11 +2197,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return new Implementations() {{
               if (field.isOptional()) {
                 add(proto3MessageOrBuilder.load(),
-                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "has{}", field.fieldWriter.fieldDescriptor),
+                    Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "has{}", field.protoDescriptor()),
                     Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
               }
-
-//               System.out.println("field path: " + field.fieldPath + ", " + fieldPathToMethodDescription.get(field.fieldPath));
 
               add(recordConsumerVar.load(),
                   new TextConstant(field.fieldWriter.fieldName),
@@ -2238,7 +2209,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                   Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
                   MethodVariableAccess.loadThis(),
                   proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}OrBuilder", field.fieldWriterDescriptor()),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}OrBuilder", field.protoDescriptor()),
                   MethodInvocation.invoke(fieldPathToMethodDescription.get(field.fieldPath)),
                   recordConsumerVar.load(),
                   Codegen.invokeMethod(Reflection.RecordConsumer.endGroup),
@@ -2349,17 +2320,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
       }
 
-      private String newWriteAllFieldsForMessageMethod(FieldPath fieldPath,
-                                                       Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
+      private void registerWriteAllFieldsForMessageMethod(MessageWriterVisitor.RegularField<?> field) {
         String methodName;
+        FieldPath fieldPath = field.fieldPath;
         if (fieldPath.isRoot()) {
           methodName = Reflection.FastMessageWriter.writeAllFields.getName();
-          if (!fieldPathToMethodName.isEmpty()) {
-            throw new IllegalStateException();
-          }
         } else {
           methodName =
-              Reflection.FastMessageWriter.writeAllFields.getName() + "$" + fieldPathToMethodName.size();
+              Reflection.FastMessageWriter.writeAllFields.getName() + "$" + fieldPathToMethodDescription.size();
         }
         fieldPathToMethodName.put(fieldPath, methodName);
 
@@ -2368,12 +2336,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               methodName,
               Visibility.PRIVATE.getMask(),
               ForLoadedType.of(void.class),
-              Arrays.asList(ForLoadedType.of(proto3MessageOrBuilderInterface)));
+              Arrays.asList(ForLoadedType.of(field.getFieldReflectionTypeProto3MessageOrBuilderInterface().get())));
 
           fieldPathToMethodDescriptionToken.put(fieldPath, token);
           fieldPathToMethodDescription.put(fieldPath, new MethodDescription.Latent(typeDescription, token));
         }
-        return methodName;
       }
 
       @Override
@@ -2838,6 +2805,20 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           .invokeExact();
     }
 
+    static <T extends ProtocolMessageEnum> IntFunction<T> getEnumForNumber(Class<T> enumClazz)
+        throws Throwable {
+      MethodHandles.Lookup lookup = MethodHandles.lookup();
+      return (IntFunction<T>) LambdaMetafactory.metafactory(
+              lookup,
+              "apply",
+              MethodType.methodType(IntFunction.class),
+              MethodType.methodType(Object.class, int.class),
+              lookup.unreflect(getEnumForNumberMethod(enumClazz)),
+              MethodType.methodType(enumClazz, int.class))
+          .getTarget()
+          .invokeExact();
+    }
+
     static LongValueGetter getGetLongValue(
         FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
         throws Throwable {
@@ -3023,7 +3004,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         throw new IllegalStateException("not supported for repeated fields, but got " + fieldDescriptor);
       }
       String mapOrBuilder = fieldDescriptor.isMapField()
-          ? "Map"
+          ? fieldDescriptor.getMessageType().getFields().get(1).getJavaType() == FieldDescriptor.JavaType.ENUM ? "ValueMap" : "Map"
           : fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE ? "OrBuilder" : "";
       return ReflectionUtil.getDeclaredMethod(
           proto3MessageOrBuilderInterface,
@@ -3042,6 +3023,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       return ReflectionUtil.getDeclaredMethod(
           proto3MessageOrBuilderInterface,
           "get" + ReflectionUtil.getFieldNameForMethod(fieldDescriptor) + enumValueSuffix);
+    }
+
+    static Method getEnumForNumberMethod(
+        Class<? extends ProtocolMessageEnum> clazz
+    ) {
+      return ReflectionUtil.getDeclaredMethod(clazz, "forNumber", int.class);
     }
 
     static Method getGetLongValueMethod(
@@ -3200,55 +3187,59 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       for (int i = 0; i < fieldWriters.length; i++) {
         ProtoWriteSupport<?>.FieldWriter fieldWriter = fieldWriters[i];
         FieldOfObjectWriter fieldOfObjectWriter =
-            createFieldOfObjectWriter(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
-        fieldOfObjectWriter.setFieldWriter(fieldWriter);
+            createFieldOfObjectWriter(proto3MessageOrBuilderInterface, fieldWriter);
         fieldOfObjectWriters[i] = fieldOfObjectWriter;
       }
 
       return new JavaReflectionProto3FastMessageWriter(proto3MessageOrBuilderInterface, fieldOfObjectWriters);
     }
 
-    static FieldOfObjectWriter createFieldOfObjectWriter(
-        FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
+    static FieldOfObjectWriter createFieldOfObjectWriter(Class<? extends MessageOrBuilder> owningProto3MessageOrBuilderInterface, ProtoWriteSupport<?>.FieldWriter fieldWriter) {
+      FieldDescriptor fieldDescriptor = fieldWriter.fieldDescriptor;
       try {
         switch (fieldDescriptor.getJavaType()) {
           case INT:
             return fieldDescriptor.isRepeated()
-                ? new IntListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new IntFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new IntListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new IntFieldOfObjectWriter((ProtoWriteSupport<?>.IntWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
           case LONG:
             return fieldDescriptor.isRepeated()
-                ? new LongListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new LongFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new LongListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new LongFieldOfObjectWriter((ProtoWriteSupport<?>.LongWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
           case FLOAT:
             return fieldDescriptor.isRepeated()
-                ? new FloatListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new FloatFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new FloatListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new FloatFieldOfObjectWriter((ProtoWriteSupport<?>.FloatWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
           case DOUBLE:
             return fieldDescriptor.isRepeated()
-                ? new DoubleListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new DoubleFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new DoubleListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new DoubleFieldOfObjectWriter((ProtoWriteSupport<?>.DoubleWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
           case BOOLEAN:
             return fieldDescriptor.isRepeated()
-                ? new BooleanListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new BooleanFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new BooleanListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new BooleanFieldOfObjectWriter((ProtoWriteSupport<?>.BooleanWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
           case STRING:
           case BYTE_STRING:
             return fieldDescriptor.isRepeated()
-                ? new ObjectListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new ObjectFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                ? new ObjectListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new ObjectFieldOfObjectWriter(fieldWriter, owningProto3MessageOrBuilderInterface);
           case ENUM:
             return fieldDescriptor.isRepeated()
-                ? new EnumListFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface)
-                : new EnumFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
-          case MESSAGE:
+                ? new EnumListFieldOfObjectWriter((ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                : new EnumFieldOfObjectWriter((ProtoWriteSupport<?>.EnumWriter) fieldWriter, owningProto3MessageOrBuilderInterface);
+          case MESSAGE: //this also covers when message is written as bytes
             if (fieldDescriptor.isMapField()) {
-              return new MapFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+              ProtoWriteSupport<?>.MapWriter mapWriter = (ProtoWriteSupport<?>.MapWriter) fieldWriter;
+              if (mapWriter.valueWriter.fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM) {
+                return new MapEnumFieldOfObjectWriter(mapWriter, owningProto3MessageOrBuilderInterface);
+              } else {
+                return new MapFieldOfObjectWriter(mapWriter, owningProto3MessageOrBuilderInterface);
+              }
             } else {
               return fieldDescriptor.isRepeated()
                   ? new ObjectListFieldOfObjectWriter(
-                      fieldDescriptor, proto3MessageOrBuilderInterface)
-                  : new ObjectFieldOfObjectWriter(fieldDescriptor, proto3MessageOrBuilderInterface);
+                  (ProtoWriteSupport<?>.ArrayWriter) fieldWriter, owningProto3MessageOrBuilderInterface)
+                  : new ObjectFieldOfObjectWriter(fieldWriter, owningProto3MessageOrBuilderInterface);
             }
         }
       } catch (Throwable t) {
@@ -3259,8 +3250,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     interface FieldOfObjectWriter {
-      void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter);
-
       void writeFieldOfObject(Object object);
     }
 
@@ -3324,18 +3313,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final ObjectValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.FieldWriter fieldWriter;
+      final ProtoWriteSupport<?>.FieldWriter fieldWriter;
 
       ObjectFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.FieldWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetObjectValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
         this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetObjectValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3353,20 +3338,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final ObjectListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.FieldWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.FieldWriter elementWriter;
 
       ObjectListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetObjectListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetObjectListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3390,18 +3371,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final IntValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.IntWriter fieldWriter;
+      final ProtoWriteSupport<?>.IntWriter fieldWriter;
 
       IntFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.IntWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetIntValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.IntWriter) fieldWriter;
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetIntValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3419,20 +3396,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final IntListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.IntWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.IntWriter elementWriter;
 
       IntListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetIntListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.IntWriter) arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.IntWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetIntListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3456,18 +3429,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final LongValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.LongWriter fieldWriter;
+      final ProtoWriteSupport<?>.LongWriter fieldWriter;
 
       LongFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.LongWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetLongValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.LongWriter) fieldWriter;
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetLongValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3485,20 +3454,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final LongListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.LongWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.LongWriter elementWriter;
 
       LongListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetLongListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.LongWriter) arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.LongWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetLongListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3527,17 +3492,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       ProtoWriteSupport<?>.FieldWriter valueWriter;
 
       MapFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.MapWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getMap = getGetObjectValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.mapWriter = (ProtoWriteSupport<?>.MapWriter) fieldWriter;
-        this.keyWriter = mapWriter.keyWriter;
-        this.valueWriter = mapWriter.valueWriter;
+        this.mapWriter = fieldWriter;
+        this.keyWriter = fieldWriter.keyWriter;
+        this.valueWriter = (ProtoWriteSupport<?>.FieldWriter) fieldWriter.valueWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getMap = getGetObjectValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3562,18 +3523,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final FloatValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.FloatWriter fieldWriter;
+      final ProtoWriteSupport<?>.FloatWriter fieldWriter;
 
       FloatFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.FloatWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetFloatValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.FloatWriter) fieldWriter;
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetFloatValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3591,20 +3548,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final FloatListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.FloatWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.FloatWriter elementWriter;
 
       FloatListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetFloatListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.FloatWriter) arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.FloatWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetFloatListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3628,18 +3581,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final DoubleValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.DoubleWriter fieldWriter;
+      final ProtoWriteSupport<?>.DoubleWriter fieldWriter;
 
       DoubleFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.DoubleWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetDoubleValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.DoubleWriter) fieldWriter;
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetDoubleValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3657,20 +3606,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final DoubleListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.DoubleWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.DoubleWriter elementWriter;
 
       DoubleListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetDoubleListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.DoubleWriter) arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.DoubleWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetDoubleListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3691,27 +3636,23 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     static class EnumFieldOfObjectWriter implements FieldOfObjectWriter {
-      final ObjectValueGetter getEnum;
       final IntValueGetter getEnumValue;
       final FieldHasValue fieldHasValue;
       final Descriptors.EnumDescriptor enumDescriptor;
       final List<Descriptors.EnumValueDescriptor> enumValues;
+      final IntFunction<? extends ProtocolMessageEnum> forNumber;
 
-      ProtoWriteSupport<?>.EnumWriter fieldWriter;
+      final ProtoWriteSupport<?>.EnumWriter fieldWriter;
 
       EnumFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.EnumWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getEnum = getGetObjectValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getEnumValue = getGetIntValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.enumDescriptor = fieldDescriptor.getEnumType();
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getEnumValue = getGetIntValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.enumDescriptor = fieldWriter.fieldDescriptor.getEnumType();
         this.enumValues = enumDescriptor.getValues();
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.EnumWriter) fieldWriter;
+        this.forNumber = getEnumForNumber((Class<? extends ProtocolMessageEnum>) fieldWriter.getFieldReflectionType());
       }
 
       @Override
@@ -3721,14 +3662,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
         fieldWriter.writeBeforeAll();
 
-        ProtocolMessageEnum enum_ = (ProtocolMessageEnum) getEnum.getValue(object);
+        int enumNumber = getEnumValue.getValue(object);
+        ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
         Enum<?> javaEnum = (Enum<?>) enum_;
         Descriptors.EnumValueDescriptor enumValueDescriptor;
-        if (javaEnum.ordinal() < enumValues.size()) {
+        if (javaEnum != null) {
           enumValueDescriptor = enumValues.get(javaEnum.ordinal());
         } else {
-          enumValueDescriptor =
-              enumDescriptor.findValueByNumberCreatingIfUnknown(getEnumValue.getValue(object));
+          enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
         }
         fieldWriter.writeRawValue(enumValueDescriptor);
 
@@ -3738,28 +3679,24 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     static class EnumListFieldOfObjectWriter implements FieldOfObjectWriter {
       final GetRepeatedFieldSize getRepeatedFieldSize;
-      final ObjectListElementGetter getEnumListElement;
       final IntListElementGetter getEnumValueListElement;
       final Descriptors.EnumDescriptor enumDescriptor;
       final List<Descriptors.EnumValueDescriptor> enumValues;
+      final IntFunction<? extends ProtocolMessageEnum> forNumber;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.EnumWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.EnumWriter elementWriter;
 
       EnumListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getEnumListElement = getGetObjectListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getEnumValueListElement = getGetIntListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.enumDescriptor = fieldDescriptor.getEnumType();
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.EnumWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getEnumValueListElement = getGetIntListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.enumDescriptor = fieldWriter.fieldDescriptor.getEnumType();
         this.enumValues = enumDescriptor.getValues();
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.EnumWriter) arrayWriter.fieldWriter;
+        this.forNumber = getEnumForNumber((Class<? extends ProtocolMessageEnum>) elementWriter.getFieldReflectionType());
       }
 
       @Override
@@ -3771,14 +3708,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         arrayWriter.writeBeforeAll();
         for (int i = 0; i < size; i++) {
           arrayWriter.writeBeforeElement();
-          ProtocolMessageEnum enum_ = (ProtocolMessageEnum) getEnumListElement.getElement(object, i);
+          int enumNumber = getEnumValueListElement.getElement(object, i);
+          ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
           Enum<?> javaEnum = (Enum<?>) enum_;
           Descriptors.EnumValueDescriptor enumValueDescriptor;
-          if (javaEnum.ordinal() < enumValues.size()) {
+          if (javaEnum != null) {
             enumValueDescriptor = enumValues.get(javaEnum.ordinal());
           } else {
-            enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(
-                getEnumValueListElement.getElement(object, i));
+            enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
           }
           elementWriter.writeRawValue(enumValueDescriptor);
           arrayWriter.writeAfterElement();
@@ -3787,22 +3724,68 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
     }
 
+    static class MapEnumFieldOfObjectWriter implements FieldOfObjectWriter {
+      final GetRepeatedFieldSize getRepeatedFieldSize;
+      final ObjectValueGetter getMap;
+      final Descriptors.EnumDescriptor enumDescriptor;
+      final List<Descriptors.EnumValueDescriptor> enumValues;
+      final IntFunction<? extends ProtocolMessageEnum> forNumber;
+
+      final ProtoWriteSupport<?>.MapWriter mapWriter;
+      final ProtoWriteSupport<?>.FieldWriter keyWriter;
+      final ProtoWriteSupport<?>.EnumWriter valueWriter;
+
+      MapEnumFieldOfObjectWriter(
+          ProtoWriteSupport<?>.MapWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          throws Throwable {
+        this.mapWriter = fieldWriter;
+        this.keyWriter = fieldWriter.keyWriter;
+        this.valueWriter = (ProtoWriteSupport<?>.EnumWriter) fieldWriter.valueWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getMap = getGetObjectValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.enumDescriptor = valueWriter.fieldDescriptor.getEnumType();
+        this.enumValues = enumDescriptor.getValues();
+        this.forNumber = getEnumForNumber((Class<? extends ProtocolMessageEnum>) valueWriter.getFieldReflectionType());
+      }
+
+      @Override
+      public void writeFieldOfObject(Object object) {
+        int size = getRepeatedFieldSize.getSize(object);
+        if (size == 0) {
+          return;
+        }
+        mapWriter.writeBeforeAll();
+        Map<?, Integer> map = (Map) getMap.getValue(object);
+        map.forEach((k, v) -> {
+          mapWriter.writeBeforeElement();
+          keyWriter.writeField(k);
+          ProtocolMessageEnum enum_ = forNumber.apply(v);
+          Enum<?> javaEnum = (Enum<?>) enum_;
+          Descriptors.EnumValueDescriptor enumValueDescriptor;
+          if (javaEnum != null) {
+            enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+          } else {
+            enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(v);
+          }
+          valueWriter.writeField(enumValueDescriptor);
+          mapWriter.writeAfterElement();
+        });
+        mapWriter.writeAfterAll();
+      }
+    }
+
     static class BooleanFieldOfObjectWriter implements FieldOfObjectWriter {
       final BooleanValueGetter getValue;
       final FieldHasValue fieldHasValue;
 
-      ProtoWriteSupport<?>.BooleanWriter fieldWriter;
+      final ProtoWriteSupport<?>.BooleanWriter fieldWriter;
 
       BooleanFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.BooleanWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.fieldHasValue = getHasValueOrNull(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getValue = getGetBooleanValue(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.fieldWriter = (ProtoWriteSupport<?>.BooleanWriter) fieldWriter;
+        this.fieldWriter = fieldWriter;
+        this.fieldHasValue = getHasValueOrNull(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getValue = getGetBooleanValue(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override
@@ -3820,20 +3803,16 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final GetRepeatedFieldSize getRepeatedFieldSize;
       final BooleanListElementGetter getListElement;
 
-      ProtoWriteSupport<?>.ArrayWriter arrayWriter;
-      ProtoWriteSupport<?>.BooleanWriter elementWriter;
+      final ProtoWriteSupport<?>.ArrayWriter arrayWriter;
+      final ProtoWriteSupport<?>.BooleanWriter elementWriter;
 
       BooleanListFieldOfObjectWriter(
-          FieldDescriptor fieldDescriptor, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
+          ProtoWriteSupport<?>.ArrayWriter fieldWriter, Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface)
           throws Throwable {
-        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldDescriptor, proto3MessageOrBuilderInterface);
-        this.getListElement = getGetBooleanListElement(fieldDescriptor, proto3MessageOrBuilderInterface);
-      }
-
-      @Override
-      public void setFieldWriter(ProtoWriteSupport<?>.FieldWriter fieldWriter) {
-        this.arrayWriter = (ProtoWriteSupport<?>.ArrayWriter) fieldWriter;
-        this.elementWriter = (ProtoWriteSupport<?>.BooleanWriter) arrayWriter.fieldWriter;
+        this.arrayWriter = fieldWriter;
+        this.elementWriter = (ProtoWriteSupport<?>.BooleanWriter) fieldWriter.fieldWriter;
+        this.getRepeatedFieldSize = getRepeatedFieldSize(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
+        this.getListElement = getGetBooleanListElement(fieldWriter.fieldDescriptor, proto3MessageOrBuilderInterface);
       }
 
       @Override

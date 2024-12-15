@@ -148,6 +148,14 @@ message MapIntMessage {
     map<int32, int32> mapInt = 1;
 }
 
+message MapEnumMessage {
+  enum Enum {
+    A = 0;
+    B = 1;
+  }
+  map<int32, Enum> mapEnum = 1;
+}
+
 message HighIndexMessage {
     repeated int32 repeatedInt = 50000;
 }

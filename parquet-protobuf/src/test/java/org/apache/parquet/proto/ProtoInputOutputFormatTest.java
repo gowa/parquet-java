@@ -365,6 +365,29 @@ public class ProtoInputOutputFormatTest {
   }
 
   @Test
+  public void testProto3MapEnumMessageClassSchemaCompliant() throws Exception {
+    TestProto3.MapEnumMessage msgEmpty =
+        TestProto3.MapEnumMessage.newBuilder().build();
+    TestProto3.MapEnumMessage msgNonEmpty = TestProto3.MapEnumMessage.newBuilder()
+        .putMapEnum(1, TestProto3.MapEnumMessage.Enum.A)
+        .putMapEnum(2, TestProto3.MapEnumMessage.Enum.B)
+        .build();
+
+    Configuration conf = new Configuration();
+    ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
+
+    Path outputPath = new WriteUsingMR(conf).write(msgEmpty, msgNonEmpty);
+    ReadUsingMR readUsingMR = new ReadUsingMR(conf);
+    String customClass = TestProto3.MapEnumMessage.class.getName();
+    ProtoReadSupport.setProtobufClass(readUsingMR.getConfiguration(), customClass);
+    List<Message> result = readUsingMR.read(outputPath);
+
+    assertEquals(2, result.size());
+    assertEquals(msgEmpty, result.get(0));
+    assertEquals(msgNonEmpty, result.get(1));
+  }
+
+  @Test
   public void testRepeatedInnerMessageClass() throws Exception {
     TestProtobuf.RepeatedInnerMessage msgEmpty =
         TestProtobuf.RepeatedInnerMessage.newBuilder().build();
