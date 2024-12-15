@@ -1888,6 +1888,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               Implementation implementation = null;
               if (field.isPrimitive()) {
                 implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
+              } else if (field.isBinary()) {
+                implementation = writeBinaryField(proto3MessageOrBuilder, recordConsumerVar, field);
+              } else if (field.isString()) {
+                implementation = writeStringField(proto3MessageOrBuilder, recordConsumerVar, field);
+              } else if (field.isProtoWrapper()) {
+                implementation = writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
+              } else if (field.isEnum()) {
+                implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, field);
               }
               if (implementation == null) {
                 implementation = notOptimizedField(field);
@@ -1923,141 +1931,163 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           return implementation;
         }
 
-        private Implementation writePrimitiveField(
-            LocalVar proto3MessageOrBuilder,
-            LocalVar recordConsumerVar,
-            MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          if (field.isRepeated()) {
-            return (new Implementations() {
-              {
-                Label afterIfCountGreaterThanZero = new Label();
-                try (LocalVar countVar = localVars.register(int.class)) {
+        private Implementation writeBinaryField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
+        }
+
+        private Implementation writeStringField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
+        }
+
+        private Implementation writeProtoWrapperField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
+        }
+
+        private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
+        }
+
+        abstract class RegularFieldWriterTemplate extends Implementations {
+          RegularFieldWriterTemplate(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+            if (field.isRepeated()) {
+              Label afterIfCountGreaterThanZero = new Label();
+              try (LocalVar countVar = localVars.register(int.class)) {
+                add(
+                    proto3MessageOrBuilder.load(),
+                    Codegen.invokeProtoMethod(
+                        proto3MessageOrBuilder.clazz(),
+                        "get{}Count",
+                        field.protoDescriptor()),
+                    countVar.store(),
+                    countVar.load(),
+                    Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
+                    recordConsumerVar.load(),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.startField));
+
+                if (writeSpecsCompliant()) {
                   add(
-                      proto3MessageOrBuilder.load(),
-                      Codegen.invokeProtoMethod(
-                          proto3MessageOrBuilder.clazz(),
-                          "get{}Count",
-                          field.protoDescriptor()),
-                      countVar.store(),
-                      countVar.load(),
-                      Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
                       recordConsumerVar.load(),
-                      new TextConstant(field.parquetFieldName()),
-                      IntegerConstant.forValue(field.parquetFieldIndex()),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                      recordConsumerVar.load(),
+                      new TextConstant("list"),
+                      IntegerConstant.forValue(0),
                       Codegen.invokeMethod(Reflection.RecordConsumer.startField));
+                }
+
+                Label nextIteration = new Label();
+                Label afterForLoop = new Label();
+                try (LocalVar iVar = localVars.register(int.class)) {
+                  add(
+                      IntegerConstant.forValue(0),
+                      iVar.store(),
+                      Codegen.visitLabel(nextIteration),
+                      localVars.frameEmptyStack(),
+                      iVar.load(),
+                      countVar.load(),
+                      Codegen.jumpTo(Opcodes.IF_ICMPGE, afterForLoop));
 
                   if (writeSpecsCompliant()) {
                     add(
                         recordConsumerVar.load(),
                         Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
                         recordConsumerVar.load(),
-                        new TextConstant("list"),
+                        new TextConstant("element"),
                         IntegerConstant.forValue(0),
                         Codegen.invokeMethod(Reflection.RecordConsumer.startField));
                   }
 
-                  Label nextIteration = new Label();
-                  Label afterForLoop = new Label();
-                  try (LocalVar iVar = localVars.register(int.class)) {
-                    add(
-                        IntegerConstant.forValue(0),
-                        iVar.store(),
-                        Codegen.visitLabel(nextIteration),
-                        localVars.frameEmptyStack(),
-                        iVar.load(),
-                        countVar.load(),
-                        Codegen.jumpTo(Opcodes.IF_ICMPGE, afterForLoop));
-
-                    if (writeSpecsCompliant()) {
-                      add(
-                          recordConsumerVar.load(),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                          recordConsumerVar.load(),
-                          new TextConstant("element"),
-                          IntegerConstant.forValue(0),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.startField));
-                    }
-
-                    add(
-                        recordConsumerVar.load(),
-                        proto3MessageOrBuilder.load(),
-                        iVar.load(),
-                        Codegen.invokeProtoMethod(
-                            proto3MessageOrBuilder.clazz(),
-                            "get{}",
-                            field.protoDescriptor(),
-                            int.class),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(
-                            field.getFieldReflectionType())));
-
-                    if (writeSpecsCompliant()) {
-                      add(
-                          recordConsumerVar.load(),
-                          new TextConstant("element"),
-                          IntegerConstant.forValue(0),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.endField),
-                          recordConsumerVar.load(),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
-                    }
-
-                    add(Codegen.incIntVar(iVar, 1), Codegen.jumpTo(Opcodes.GOTO, nextIteration));
-                  }
-
-                  add(Codegen.visitLabel(afterForLoop), localVars.frameEmptyStack());
+                  writeRepeatedRawValue(proto3MessageOrBuilder, recordConsumerVar, iVar);
 
                   if (writeSpecsCompliant()) {
                     add(
                         recordConsumerVar.load(),
-                        new TextConstant("list"),
+                        new TextConstant("element"),
                         IntegerConstant.forValue(0),
                         Codegen.invokeMethod(Reflection.RecordConsumer.endField),
                         recordConsumerVar.load(),
                         Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
                   }
 
+                  add(Codegen.incIntVar(iVar, 1), Codegen.jumpTo(Opcodes.GOTO, nextIteration));
+                }
+
+                add(Codegen.visitLabel(afterForLoop), localVars.frameEmptyStack());
+
+                if (writeSpecsCompliant()) {
                   add(
                       recordConsumerVar.load(),
-                      new TextConstant(field.parquetFieldName()),
-                      IntegerConstant.forValue(field.parquetFieldIndex()),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.endField));
-                }
-                add(Codegen.visitLabel(afterIfCountGreaterThanZero), localVars.frameEmptyStack());
-              }
-            });
-          } else {
-            Label afterEndField = new Label();
-            return new Implementations() {
-              {
-                if (field.isOptional()) {
-                  add(
-                      proto3MessageOrBuilder.load(),
-                      Codegen.invokeProtoMethod(
-                          proto3MessageOrBuilder.clazz(), "has{}", field.protoDescriptor()),
-                      Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
+                      new TextConstant("list"),
+                      IntegerConstant.forValue(0),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endField),
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
                 }
 
                 add(
                     recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriter.fieldName),
-                    IntegerConstant.forValue(field.fieldWriter.index),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.startField),
-                    recordConsumerVar.load(),
+                    new TextConstant(field.parquetFieldName()),
+                    IntegerConstant.forValue(field.parquetFieldIndex()),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.endField));
+              }
+              add(Codegen.visitLabel(afterIfCountGreaterThanZero), localVars.frameEmptyStack());
+            } else {
+              Label afterEndField = new Label();
+              if (field.isOptional()) {
+                add(
                     proto3MessageOrBuilder.load(),
                     Codegen.invokeProtoMethod(
-                        proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor()),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(
-                        field.getFieldReflectionType())),
-                    recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriter.fieldName),
-                    IntegerConstant.forValue(field.fieldWriter.index),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.endField));
-
-                if (field.isOptional()) {
-                  add(Codegen.visitLabel(afterEndField), localVars.frameEmptyStack());
-                }
+                        proto3MessageOrBuilder.clazz(), "has{}", field.protoDescriptor()),
+                    Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
               }
-            };
+
+              add(
+                  recordConsumerVar.load(),
+                  new TextConstant(field.fieldWriter.fieldName),
+                  IntegerConstant.forValue(field.fieldWriter.index),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+              );
+              writeRawValue(proto3MessageOrBuilder, recordConsumerVar);
+              add(recordConsumerVar.load(),
+                  new TextConstant(field.fieldWriter.fieldName),
+                  IntegerConstant.forValue(field.fieldWriter.index),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endField));
+
+              if (field.isOptional()) {
+                add(Codegen.visitLabel(afterEndField), localVars.frameEmptyStack());
+              }
+            }
           }
+
+          abstract void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                             LocalVar iVar);
+
+          abstract void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar);
+        }
+
+        private Implementation writePrimitiveField(
+            LocalVar proto3MessageOrBuilder,
+            LocalVar recordConsumerVar,
+            MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            @Override
+            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, LocalVar iVar) {
+              add(recordConsumerVar.load(),
+                  proto3MessageOrBuilder.load(),
+                  iVar.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor(), int.class),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get( field.getFieldReflectionType())));
+            }
+
+            @Override
+            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
+              add(recordConsumerVar.load(),
+                  proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor()),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.getFieldReflectionType())));
+            }
+          };
         }
 
         private Implementation writeMessageField(
@@ -2068,146 +2098,41 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               .isPresent()) {
             return null;
           }
-          if (field.isRepeated()) {
-            return (new Implementations() {
-              {
-                Label afterIfCountGreaterThanZero = new Label();
-                try (LocalVar countVar = localVars.register(int.class)) {
-                  add(
-                      proto3MessageOrBuilder.load(),
-                      Codegen.invokeProtoMethod(
-                          proto3MessageOrBuilder.clazz(),
-                          "get{}Count",
-                          field.protoDescriptor()),
-                      countVar.store(),
-                      countVar.load(),
-                      Codegen.jumpTo(Opcodes.IFLE, afterIfCountGreaterThanZero),
-                      recordConsumerVar.load(),
-                      new TextConstant(field.parquetFieldName()),
-                      IntegerConstant.forValue(field.parquetFieldIndex()),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.startField));
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            @Override
+            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, LocalVar iVar) {
+              add(recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                  MethodVariableAccess.loadThis(),
+                  proto3MessageOrBuilder.load(),
+                  iVar.load(),
+                  Codegen.invokeProtoMethod(
+                      proto3MessageOrBuilder.clazz(),
+                      "get{}OrBuilder",
+                      field.protoDescriptor(),
+                      int.class),
+                  MethodInvocation.invoke(
+                      fieldPathToMethodDescription.get(field.fieldPath)),
+                  recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
+            }
 
-                  if (writeSpecsCompliant()) {
-                    add(
-                        recordConsumerVar.load(),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                        recordConsumerVar.load(),
-                        new TextConstant("list"),
-                        IntegerConstant.forValue(0),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.startField));
-                  }
-
-                  Label nextIteration = new Label();
-                  Label afterForLoop = new Label();
-                  try (LocalVar iVar = localVars.register(int.class)) {
-                    add(
-                        IntegerConstant.forValue(0),
-                        iVar.store(),
-                        Codegen.visitLabel(nextIteration),
-                        localVars.frameEmptyStack(),
-                        iVar.load(),
-                        countVar.load(),
-                        Codegen.jumpTo(Opcodes.IF_ICMPGE, afterForLoop));
-
-                    if (writeSpecsCompliant()) {
-                      add(
-                          recordConsumerVar.load(),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                          recordConsumerVar.load(),
-                          new TextConstant("element"),
-                          IntegerConstant.forValue(0),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.startField));
-                    }
-
-                    add(
-                        recordConsumerVar.load(),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                        MethodVariableAccess.loadThis(),
-                        proto3MessageOrBuilder.load(),
-                        iVar.load(),
-                        Codegen.invokeProtoMethod(
-                            proto3MessageOrBuilder.clazz(),
-                            "get{}OrBuilder",
-                            field.protoDescriptor(),
-                            int.class),
-                        MethodInvocation.invoke(
-                            fieldPathToMethodDescription.get(field.fieldPath)),
-                        recordConsumerVar.load(),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
-
-                    if (writeSpecsCompliant()) {
-                      add(
-                          recordConsumerVar.load(),
-                          new TextConstant("element"),
-                          IntegerConstant.forValue(0),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.endField),
-                          recordConsumerVar.load(),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
-                    }
-
-                    add(Codegen.incIntVar(iVar, 1), Codegen.jumpTo(Opcodes.GOTO, nextIteration));
-                  }
-
-                  add(Codegen.visitLabel(afterForLoop), localVars.frameEmptyStack());
-
-                  if (writeSpecsCompliant()) {
-                    add(
-                        recordConsumerVar.load(),
-                        new TextConstant("list"),
-                        IntegerConstant.forValue(0),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.endField),
-                        recordConsumerVar.load(),
-                        Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
-                  }
-
-                  add(
-                      recordConsumerVar.load(),
-                      new TextConstant(field.parquetFieldName()),
-                      IntegerConstant.forValue(field.parquetFieldIndex()),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.endField));
-                }
-                add(Codegen.visitLabel(afterIfCountGreaterThanZero), localVars.frameEmptyStack());
-              }
-            });
-          } else {
-            Label afterEndField = new Label();
-            return new Implementations() {
-              {
-                if (field.isOptional()) {
-                  add(
-                      proto3MessageOrBuilder.load(),
-                      Codegen.invokeProtoMethod(
-                          proto3MessageOrBuilder.clazz(), "has{}", field.protoDescriptor()),
-                      Codegen.jumpTo(Opcodes.IFEQ, afterEndField));
-                }
-
-                add(
-                    recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriter.fieldName),
-                    IntegerConstant.forValue(field.fieldWriter.index),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.startField),
-                    recordConsumerVar.load(),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                    MethodVariableAccess.loadThis(),
-                    proto3MessageOrBuilder.load(),
-                    Codegen.invokeProtoMethod(
-                        proto3MessageOrBuilder.clazz(),
-                        "get{}OrBuilder",
-                        field.protoDescriptor()),
-                    MethodInvocation.invoke(fieldPathToMethodDescription.get(field.fieldPath)),
-                    recordConsumerVar.load(),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.endGroup),
-                    recordConsumerVar.load(),
-                    new TextConstant(field.fieldWriter.fieldName),
-                    IntegerConstant.forValue(field.fieldWriter.index),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.endField));
-
-                if (field.isOptional()) {
-                  add(Codegen.visitLabel(afterEndField), localVars.frameEmptyStack());
-                }
-              }
-            };
-          }
+            @Override
+            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
+              add(recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                  MethodVariableAccess.loadThis(),
+                  proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(
+                      proto3MessageOrBuilder.clazz(),
+                      "get{}OrBuilder",
+                      field.protoDescriptor()),
+                  MethodInvocation.invoke(fieldPathToMethodDescription.get(field.fieldPath)),
+                  recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+              );
+            }
+          };
         }
       }
 
