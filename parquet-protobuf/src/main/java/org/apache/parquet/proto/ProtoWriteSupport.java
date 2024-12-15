@@ -1873,14 +1873,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               }
               Implementation implementation =  writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
               if (implementation == null) {
-                JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
-                        field.fieldWriter);
-
-                implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                    .on(fieldOfObjectWriter)
-                    .withArgument(0)
-                    .andThen(NOOP);
+                implementation = notOptimizedField(field);
               }
               steps.add(implementation);
               return false;
@@ -1893,44 +1886,35 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
               }
               if (implementation == null) {
-                JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                    JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
-                        field.fieldWriter);
-
-                implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                    .on(fieldOfObjectWriter)
-                    .withArgument(0)
-                    .andThen(NOOP);
+                implementation = notOptimizedField(field);
               }
               steps.add(implementation);
             }
 
             @Override
             public boolean visitMapMessageWriter(MapField field) {
-              JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
-                      field.fieldWriter);
-
-              steps.add(MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                  .on(fieldOfObjectWriter)
-                  .withArgument(0)
-                  .andThen(NOOP));
-
+              steps.add(notOptimizedField(field));
               return false;
             }
 
             @Override
             public void visitMapNonMessageWriter(MapField field) {
-              JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                  JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
-                      field.fieldWriter);
-
-              steps.add(MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                  .on(fieldOfObjectWriter)
-                  .withArgument(0)
-                  .andThen(NOOP));
+              steps.add(notOptimizedField(field));
             }
           });
+        }
+
+        private Implementation notOptimizedField(MessageWriterVisitor.Field<?> field) {
+          Implementation implementation;
+          JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
+              JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(field.getOwningTypeProto3MessageOrBuilderInterface().get(),
+                  field.fieldWriter);
+
+          implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
+              .on(fieldOfObjectWriter)
+              .withArgument(0)
+              .andThen(NOOP);
+          return implementation;
         }
 
         private Implementation writePrimitiveField(
