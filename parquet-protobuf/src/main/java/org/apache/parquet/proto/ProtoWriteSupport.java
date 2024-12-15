@@ -1716,7 +1716,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               registerWriteAllFieldsForMessageMethod(field);
               return true;
             } else {
-              notOptimizedMessageWriters.add((ProtoWriteSupport<?>.MessageWriter) field.fieldWriter);
+              notOptimizedMessageWriters.add((ProtoWriteSupport<?>.MessageWriter) field.rawValueWriter());
               return false;
             }
           }

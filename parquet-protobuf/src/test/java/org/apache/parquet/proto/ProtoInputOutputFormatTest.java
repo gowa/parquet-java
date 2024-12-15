@@ -31,6 +31,8 @@ import com.google.protobuf.util.Timestamps;
 import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.parquet.proto.test.MixProtoL1;
+import org.apache.parquet.proto.test.MixProtoL2;
 import org.apache.parquet.proto.test.TestProto3;
 import org.apache.parquet.proto.test.TestProtobuf;
 import org.apache.parquet.proto.test.TestProtobuf.FirstCustomClassMessage;
@@ -385,6 +387,56 @@ public class ProtoInputOutputFormatTest {
     assertEquals(2, result.size());
     assertEquals(msgEmpty, result.get(0));
     assertEquals(msgNonEmpty, result.get(1));
+  }
+
+  @Test
+  public void testMixProtoL1() throws Exception {
+    MixProtoL1.ProtoL1 msgEmpty =
+        MixProtoL1.ProtoL1.newBuilder().build();
+    MixProtoL1.ProtoL1 msgNonEmpty = fillProtoL1(MixProtoL1.ProtoL1.newBuilder())
+        .build();
+
+    Configuration conf = new Configuration();
+    ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
+
+    Path outputPath = new WriteUsingMR(conf).write(msgEmpty, msgNonEmpty);
+    ReadUsingMR readUsingMR = new ReadUsingMR(conf);
+    String customClass = MixProtoL1.ProtoL1.class.getName();
+    ProtoReadSupport.setProtobufClass(readUsingMR.getConfiguration(), customClass);
+    List<Message> result = readUsingMR.read(outputPath);
+
+    assertEquals(2, result.size());
+    assertEquals(msgEmpty, result.get(0));
+    assertEquals(msgNonEmpty, result.get(1));
+  }
+
+  @Test
+  public void testMixProtoL2() throws Exception {
+    MixProtoL2.ProtoL2 msgEmpty =
+        MixProtoL2.ProtoL2.newBuilder().build();
+    MixProtoL2.ProtoL2 msgNonEmpty = fillProtoL2(MixProtoL2.ProtoL2.newBuilder())
+        .build();
+
+    Configuration conf = new Configuration();
+    ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
+
+    Path outputPath = new WriteUsingMR(conf).write(msgEmpty, msgNonEmpty);
+    ReadUsingMR readUsingMR = new ReadUsingMR(conf);
+    String customClass = MixProtoL2.ProtoL2.class.getName();
+    ProtoReadSupport.setProtobufClass(readUsingMR.getConfiguration(), customClass);
+    List<Message> result = readUsingMR.read(outputPath);
+
+    assertEquals(2, result.size());
+    assertEquals(msgEmpty, result.get(0));
+    assertEquals(msgNonEmpty, result.get(1));
+  }
+
+  private MixProtoL1.ProtoL1.Builder fillProtoL1(MixProtoL1.ProtoL1.Builder b) {
+    return b;
+  }
+
+  private MixProtoL2.ProtoL2.Builder fillProtoL2(MixProtoL2.ProtoL2.Builder b) {
+    return b;
   }
 
   @Test
