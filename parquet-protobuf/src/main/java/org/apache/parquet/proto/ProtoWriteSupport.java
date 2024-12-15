@@ -1931,23 +1931,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           return implementation;
         }
 
-        private Implementation writeBinaryField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return null;
-        }
-
-        private Implementation writeStringField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return null;
-        }
-
-        private Implementation writeProtoWrapperField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return null;
-        }
-
-        private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return null;
-        }
-
         abstract class RegularFieldWriterTemplate extends Implementations {
+          String getterMethodTemplate() {
+            return "get{}";
+          }
+
           RegularFieldWriterTemplate(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
             if (field.isRepeated()) {
               Label afterIfCountGreaterThanZero = new Label();
@@ -1998,7 +1986,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                         Codegen.invokeMethod(Reflection.RecordConsumer.startField));
                   }
 
-                  writeRepeatedRawValue(proto3MessageOrBuilder, recordConsumerVar, iVar);
+                  writeRepeatedRawValue(proto3MessageOrBuilder, recordConsumerVar, field, iVar);
 
                   if (writeSpecsCompliant()) {
                     add(
@@ -2048,7 +2036,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                   IntegerConstant.forValue(field.fieldWriter.index),
                   Codegen.invokeMethod(Reflection.RecordConsumer.startField)
               );
-              writeRawValue(proto3MessageOrBuilder, recordConsumerVar);
+
+              writeRawValue(proto3MessageOrBuilder, recordConsumerVar, field);
+
               add(recordConsumerVar.load(),
                   new TextConstant(field.fieldWriter.fieldName),
                   IntegerConstant.forValue(field.fieldWriter.index),
@@ -2060,10 +2050,29 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             }
           }
 
-          abstract void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                             LocalVar iVar);
+          void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                 MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                 LocalVar iVar) {
+            // load i-th repeated value
+            add(recordConsumerVar.load(),
+                proto3MessageOrBuilder.load(),
+                iVar.load(),
+                Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
 
-          abstract void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar);
+            convertRawValueAndWrite();
+          }
+
+          void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                 MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+            // load value on stack
+            add(recordConsumerVar.load(),
+                proto3MessageOrBuilder.load(),
+                Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
+
+            convertRawValueAndWrite();
+          }
+
+          abstract void convertRawValueAndWrite();
         }
 
         private Implementation writePrimitiveField(
@@ -2072,22 +2081,51 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
           return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
             @Override
-            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, LocalVar iVar) {
-              add(recordConsumerVar.load(),
-                  proto3MessageOrBuilder.load(),
-                  iVar.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor(), int.class),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get( field.getFieldReflectionType())));
-            }
-
-            @Override
-            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
-              add(recordConsumerVar.load(),
-                  proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), "get{}", field.protoDescriptor()),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.getFieldReflectionType())));
+            void convertRawValueAndWrite() {
+              add(Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get( field.getFieldReflectionType())));
             }
           };
+        }
+
+        private Implementation writeBinaryField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          /*
+      ByteString byteString = (ByteString) value;
+      Binary binary = Binary.fromConstantByteArray(byteString.toByteArray());
+      recordConsumer.addBinary(binary);
+
+           */
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            @Override
+            void convertRawValueAndWrite() {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+              );
+            }
+          };
+        }
+
+        private Implementation writeStringField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          /*
+      Binary binaryString = Binary.fromString((String) value);
+      recordConsumer.addBinary(binaryString);
+           */
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            @Override
+            void convertRawValueAndWrite() {
+              add(Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary));
+            }
+          };
+        }
+
+        private Implementation writeProtoWrapperField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
+        }
+
+        private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          return null;
         }
 
         private Implementation writeMessageField(
@@ -2099,38 +2137,53 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return null;
           }
           return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            @Override
-            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, LocalVar iVar) {
-              add(recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                  MethodVariableAccess.loadThis(),
-                  proto3MessageOrBuilder.load(),
-                  iVar.load(),
-                  Codegen.invokeProtoMethod(
-                      proto3MessageOrBuilder.clazz(),
-                      "get{}OrBuilder",
-                      field.protoDescriptor(),
-                      int.class),
-                  MethodInvocation.invoke(
-                      fieldPathToMethodDescription.get(field.fieldPath)),
-                  recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
+            String getterMethodTemplate() {
+              return "get{}OrBuilder";
             }
 
             @Override
-            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
-              add(recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                  MethodVariableAccess.loadThis(),
-                  proto3MessageOrBuilder.load(),
+            void convertRawValueAndWrite() {
+              add(MethodInvocation.invoke(
+                  fieldPathToMethodDescription.get(field.fieldPath)));
+            }
+
+
+            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                       MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                       LocalVar iVar) {
+              startGroup();
+              add(proto3MessageOrBuilder.load(),
+                  iVar.load(),
                   Codegen.invokeProtoMethod(
                       proto3MessageOrBuilder.clazz(),
-                      "get{}OrBuilder",
-                      field.protoDescriptor()),
-                  MethodInvocation.invoke(fieldPathToMethodDescription.get(field.fieldPath)),
-                  recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
-              );
+                      getterMethodTemplate(),
+                      field.protoDescriptor(),
+                      int.class));
+              convertRawValueAndWrite();
+              endGroup();
+            }
+
+            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                               MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+              startGroup();
+              add(proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(
+                      proto3MessageOrBuilder.clazz(),
+                      getterMethodTemplate(),
+                      field.protoDescriptor()));
+              convertRawValueAndWrite();
+              endGroup();
+            }
+
+            void startGroup() {
+              add(recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                  MethodVariableAccess.loadThis());
+            }
+
+            void endGroup() {
+              add(recordConsumerVar.load(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
             }
           };
         }
