@@ -391,10 +391,9 @@ public class ProtoInputOutputFormatTest {
 
   @Test
   public void testMixProtoL1() throws Exception {
-    MixProtoL1.ProtoL1 msgEmpty =
-        MixProtoL1.ProtoL1.newBuilder().build();
-    MixProtoL1.ProtoL1 msgNonEmpty = fillProtoL1(MixProtoL1.ProtoL1.newBuilder())
-        .build();
+    MixProtoL1.ProtoL1 msgEmpty = MixProtoL1.ProtoL1.newBuilder().build();
+    MixProtoL1.ProtoL1 msgNonEmpty =
+        fillProtoL1(MixProtoL1.ProtoL1.newBuilder()).build();
 
     Configuration conf = new Configuration();
     ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
@@ -412,10 +411,9 @@ public class ProtoInputOutputFormatTest {
 
   @Test
   public void testMixProtoL2() throws Exception {
-    MixProtoL2.ProtoL2 msgEmpty =
-        MixProtoL2.ProtoL2.newBuilder().build();
-    MixProtoL2.ProtoL2 msgNonEmpty = fillProtoL2(MixProtoL2.ProtoL2.newBuilder())
-        .build();
+    MixProtoL2.ProtoL2 msgEmpty = MixProtoL2.ProtoL2.newBuilder().build();
+    MixProtoL2.ProtoL2 msgNonEmpty =
+        fillProtoL2(MixProtoL2.ProtoL2.newBuilder()).build();
 
     Configuration conf = new Configuration();
     ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
