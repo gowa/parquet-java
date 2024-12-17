@@ -52,6 +52,7 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -69,6 +70,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntFunction;
 import java.util.stream.Stream;
 import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.Visibility;
 import net.bytebuddy.description.type.TypeDescription;
@@ -78,7 +80,9 @@ import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.dynamic.scaffold.InstrumentedType;
 import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.Implementation;
+import net.bytebuddy.implementation.Implementation.Context;
 import net.bytebuddy.implementation.MethodCall;
+import net.bytebuddy.implementation.SuperMethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
 import net.bytebuddy.implementation.bytecode.StackManipulation;
 import net.bytebuddy.implementation.bytecode.StackSize;
@@ -86,6 +90,7 @@ import net.bytebuddy.implementation.bytecode.assign.InstanceCheck;
 import net.bytebuddy.implementation.bytecode.assign.TypeCasting;
 import net.bytebuddy.implementation.bytecode.constant.IntegerConstant;
 import net.bytebuddy.implementation.bytecode.constant.TextConstant;
+import net.bytebuddy.implementation.bytecode.member.FieldAccess;
 import net.bytebuddy.implementation.bytecode.member.MethodInvocation;
 import net.bytebuddy.implementation.bytecode.member.MethodReturn;
 import net.bytebuddy.implementation.bytecode.member.MethodVariableAccess;
@@ -1351,9 +1356,31 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     abstract static class ByteBuddyProto3FastMessageWriter implements FastMessageWriter {
       final ProtoWriteSupport<?> protoWriteSupport;
+      final ProtoWriteSupport<?>.MessageWriter[] messageWriters;
 
-      ByteBuddyProto3FastMessageWriter(ProtoWriteSupport<?> protoWriteSupport) {
+      ByteBuddyProto3FastMessageWriter(ProtoWriteSupport<?> protoWriteSupport, ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
         this.protoWriteSupport = protoWriteSupport;
+        this.messageWriters = createMessageWriterArray(rootMessageWriter);
+      }
+
+      private static ProtoWriteSupport<?>.MessageWriter[] createMessageWriterArray(ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
+        final List<ProtoWriteSupport<?>.MessageWriter> writers = new ArrayList<>();
+        MessageWriterVisitor.traverse(new MessageWriterVisitor.RegularField<>(new FieldPath(), null, rootMessageWriter), new MessageWriterVisitor() {
+          @Override
+          public boolean visitMessageWriter(RegularField<?> field) {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              writers.add((ProtoWriteSupport<?>.MessageWriter) field.rawValueWriter());
+              return true;
+            }
+            return false;
+          }
+
+          @Override
+          public boolean visitMapMessageWriter(MapField field) {
+            return false;
+          }
+        });
+        return writers.toArray(new ProtoWriteSupport<?>.MessageWriter[0]);
       }
 
       /**
@@ -1362,6 +1389,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
        */
       RecordConsumer getRecordConsumer() {
         return protoWriteSupport.recordConsumer;
+      }
+
+      Map<String, Integer> enumNameNumberPairs(String enumTypeFullName) {
+        return protoWriteSupport.protoEnumBookKeeper.get(enumTypeFullName);
       }
     }
 
@@ -1383,24 +1414,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         ProtoWriteSupport<?>.MessageWriter messageWriter,
         Queue<ProtoWriteSupport<?>.FieldWriter> furtherFieldWriters) {
 
-      DynamicType.Builder<ByteBuddyProto3FastMessageWriter> classBuilder = new ByteBuddy()
-          .subclass(ByteBuddyProto3FastMessageWriter.class)
-          .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$"
-              + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet());
-
-      FastMessageWriterWriteAllFieldsImplementation impl = new FastMessageWriterWriteAllFieldsImplementation(
+      FastMessageWriterImplementation impl = new FastMessageWriterImplementation(
           protoWriteSupport,
-          messageWriter,
-          ReflectionUtil.getProto3MessageOrBuilderInterface(messageWriter.protoMessageClass)
-              .get(),
-          classBuilder.toTypeDescription());
+          messageWriter);
 
-      DynamicType.Builder.MethodDefinition.ReceiverTypeDefinition<ByteBuddyProto3FastMessageWriter>
-          writeAllFields = classBuilder
-              .method(ElementMatchers.named(Reflection.FastMessageWriter.writeAllFields.getName()))
-              .intercept(impl);
-
-      DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = writeAllFields.make();
+      DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
 
       try {
         unloaded.saveIn(new java.io.File("generated_debug"));
@@ -1413,7 +1431,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
           .getLoaded();
       return ReflectionUtil.newInstance(
-          ReflectionUtil.getConstructor(fastMessageWriterClass, ProtoWriteSupport.class), protoWriteSupport);
+          ReflectionUtil.getConstructor(fastMessageWriterClass, ProtoWriteSupport.class, ProtoWriteSupport.MessageWriter.class), protoWriteSupport, messageWriter);
     }
 
     @Override
@@ -1680,33 +1698,39 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     MessageWriter (1.1.1) [proto3]
     */
 
-    /**
-     * an implementation for {@link FastMessageWriter#writeAllFields(MessageOrBuilder)}
-     */
-    static class FastMessageWriterWriteAllFieldsImplementation implements Implementation {
+    static class FastMessageWriterImplementation {
       final ProtoWriteSupport<?> protoWriteSupport;
       final ProtoWriteSupport<?>.MessageWriter rootMessageWriter;
-      final TypeDescription typeDescription;
 
       final List<ProtoWriteSupport<?>.MessageWriter> notOptimizedMessageWriters = new ArrayList<>();
 
-      final Map<FieldPath, String> fieldPathToMethodName = new HashMap<>();
-      final Map<FieldPath, MethodDescription.Token> fieldPathToMethodDescriptionToken = new HashMap<>();
-      final Map<FieldPath, MethodDescription> fieldPathToMethodDescription = new HashMap<>();
-      final Map<String, Implementation> writeAllFieldsMethods = new HashMap<>();
+      final Map<FieldPath, String> fieldPathToMethodNameMap = new HashMap<>();
+//       final Map<FieldPath, MethodDescription.Token> fieldPathToMethodDescriptionTokenMap = new HashMap<>();
+      final Map<FieldPath, MethodDescription> fieldPathToMethodDescriptionMap = new HashMap<>();
+//       final Map<String, Implementation> writeAllFieldsMethodsMap = new HashMap<>();
 
-      FastMessageWriterWriteAllFieldsImplementation(
+      final Map<String, Integer> enumTypeFullNameToFieldIdx = new HashMap<>();
+      final Map<String, Class<?>> enumTypeFullNameToClassMap = new HashMap<>();
+
+      final DynamicType.Builder<ByteBuddyProto3FastMessageWriter>[] classBuilder;
+
+      FastMessageWriterImplementation(
           ProtoWriteSupport<?> protoWriteSupport,
-          ProtoWriteSupport<?>.MessageWriter rootMessageWriter,
-          Class<? extends MessageOrBuilder> rootProto3MessageOrBuilderInterface,
-          TypeDescription typeDescription) {
+          ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
         this.protoWriteSupport = protoWriteSupport;
         this.rootMessageWriter = rootMessageWriter;
-        this.typeDescription = typeDescription;
 
-        MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start =
+        classBuilder = new DynamicType.Builder[]{
+            new ByteBuddy()
+                .subclass(ByteBuddyProto3FastMessageWriter.class)
+                .name(ByteBuddyProto3FastMessageWriter.class.getName() + "$Generated$"
+                + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet())
+        };
+
+        final MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start =
             new MessageWriterVisitor.RegularField<>(new FieldPath(), null, rootMessageWriter);
 
+        // first scan - collect methods and fields for enums
         MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
           @Override
           public boolean visitMessageWriter(RegularField<?> field) {
@@ -1721,22 +1745,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
 
           @Override
-          public boolean visitMapMessageWriter(MapField field) {
-            return false;
-          }
-        });
-
-        MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
-          @Override
-          public boolean visitMessageWriter(RegularField<?> field) {
-            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
-                .isPresent()) {
-              writeAllFieldsMethods.put(
-                  fieldPathToMethodName.get(field.fieldPath),
-                  new WriteAllFieldsForMessageImplementation(field.asRawValueMessageWriter()));
-              return true;
-            } else {
-              return false;
+          public void visitNonMessageWriter(RegularField<?> field) {
+            if (field.isEnum()) {
+              ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
+              String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
+              if (enumTypeFullNameToFieldIdx.putIfAbsent(enumTypeFullName, enumTypeFullNameToFieldIdx.size()) == null) {
+                enumTypeFullNameToClassMap.put(enumTypeFullName, enumWriter.getFieldReflectionType());
+              }
             }
           }
 
@@ -1745,6 +1760,71 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return false;
           }
         });
+
+        // register enum fields
+        // final Map<String, Integer> enumNameNumberPairs<idx>;
+        // final Descriptors.EnumDescriptor enumDescriptor<idx>;
+        // final List<Descriptors.EnumValueDescriptor> enumValues<idx>;
+
+        for (int enumTypeFieldIdx : enumTypeFullNameToFieldIdx.values()) {
+          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), new FieldDescription.Token(
+              "enumNameNumberPairs" + enumTypeFieldIdx,
+              Modifier.PRIVATE | Modifier.FINAL,
+              TypeDescription.Generic.Builder.parameterizedType(Map.class, String.class, Integer.class).build()))
+          );
+          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), new FieldDescription.Token(
+              "enumDescriptor" + enumTypeFieldIdx,
+              Modifier.PRIVATE | Modifier.FINAL,
+              new TypeDescription.Generic.OfNonGenericType.ForLoadedType(Descriptors.EnumDescriptor.class)))
+          );
+          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), new FieldDescription.Token(
+              "enumValues" + enumTypeFieldIdx,
+              Modifier.PRIVATE | Modifier.FINAL,
+              TypeDescription.Generic.Builder.parameterizedType(List.class, Descriptors.EnumValueDescriptor.class).build()))
+          );
+        }
+
+        classBuilder[0] = classBuilder[0]
+            .constructor(ElementMatchers.any())
+            .intercept(SuperMethodCall.INSTANCE.andThen(new FastMessageWriterConstructor()));
+
+        // second scan - register methods
+        MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
+          @Override
+          public boolean visitMessageWriter(RegularField<?> field) {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
+                .isPresent()) {
+
+              classBuilder[0] = classBuilder[0].define(fieldPathToMethodDescriptionMap.get(field.fieldPath))
+                  .intercept(new WriteAllFieldsForMessageImplementation(field.asRawValueMessageWriter()));
+
+              return true;
+            } else {
+              return false;
+            }
+          }
+
+          @Override
+          public boolean visitMapMessageWriter(MapField field) {
+/*
+            classBuilder[0] = classBuilder[0].define(new MethodDescription.Latent(classBuilder[0].toTypeDescription(), new MethodDescription.Token(
+                fieldPathToMethodNameMap.get(field.fieldPath),
+                Visibility.PRIVATE.getMask(),
+                ForLoadedType.of(void.class),
+                Arrays.asList(
+                    ForLoadedType.of(
+                        field.fieldWriter.getFieldReflectionType().getKey()),
+                    ForLoadedType.of(
+                        field.fieldWriter.getFieldReflectionType().getValue()))))).intercept(NOOP);
+*/
+
+            return false;
+          }
+        });
+      }
+
+      DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> make() {
+        return classBuilder[0].make();
       }
 
       boolean unwrapProtoWrappers() {
@@ -1755,29 +1835,62 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         return protoWriteSupport.writeSpecsCompliant;
       }
 
-      class WriteAllFieldsForMessageImplementation extends WritAllFieldsImplementation {
+      class FastMessageWriterConstructor extends Implementations {
+
+        FastMessageWriterConstructor() {
+          // final Map<String, Integer> enumNameNumberPairs<idx>;
+          // final Descriptors.EnumDescriptor enumDescriptor<idx>;
+          // final List<Descriptors.EnumValueDescriptor> enumValues<idx>;
+
+          for (Map.Entry<String, Integer> enumTypeFullNameToFieldIdx : enumTypeFullNameToFieldIdx.entrySet()) {
+            String enumTypeFullName = enumTypeFullNameToFieldIdx.getKey();
+            int idx = enumTypeFullNameToFieldIdx.getValue();
+
+            add(MethodVariableAccess.loadThis(),
+                MethodVariableAccess.loadThis(),
+                new TextConstant(enumTypeFullName),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteBuddyProto3FastMessageWriter.class, "enumNameNumberPairs", String.class)),
+                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                    .filter(ElementMatchers.named("enumNameNumberPairs" + idx))
+                    .getOnly()).write()
+            );
+
+            add(MethodVariableAccess.loadThis(),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumTypeFullNameToClassMap.get(enumTypeFullName), "getDescriptor")),
+                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                    .filter(ElementMatchers.named("enumDescriptor" + idx))
+                    .getOnly()).write()
+            );
+
+            add(MethodVariableAccess.loadThis(),
+                MethodVariableAccess.loadThis(),
+                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                    .filter(ElementMatchers.named("enumDescriptor" + idx))
+                    .getOnly()).read(),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "getValues")),
+                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                    .filter(ElementMatchers.named("enumValues" + idx))
+                    .getOnly()).write()
+            );
+          }
+          add(Codegen.returnVoid());
+        }
+      }
+
+      class WriteAllFieldsForMessageImplementation extends FastMessageWriterMethodBase {
         final MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> field;
 
         WriteAllFieldsForMessageImplementation(
             MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> regularField) {
           this.field = regularField;
 
-          try (LocalVar thisLocalVar = localVars.register(typeDescription)) {
+          try (LocalVar thisLocalVar = localVars.register(classBuilder[0].toTypeDescription())) {
             writeMessageFields(regularField);
           }
         }
-
-        @Override
-        protected InstrumentedType registerMethod(InstrumentedType instrumentedType) {
-          if (!field.fieldPath.isRoot()) {
-            instrumentedType =
-                instrumentedType.withMethod(fieldPathToMethodDescriptionToken.get(field.fieldPath));
-          }
-          return instrumentedType;
-        }
       }
 
-      class WriteAllFieldsForMapEntryImplementation extends WritAllFieldsImplementation {
+      class WriteAllFieldsForMapEntryImplementation extends FastMessageWriterMethodBase {
         final FieldPath fieldPath;
         final ProtoWriteSupport<?>.MapWriter mapWriter;
 
@@ -1785,23 +1898,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           this.fieldPath = fieldPath;
           this.mapWriter = mapWriter;
         }
-
-        @Override
-        protected InstrumentedType registerMethod(InstrumentedType instrumentedType) {
-          instrumentedType = instrumentedType.withMethod(new MethodDescription.Token(
-              fieldPathToMethodName.get(fieldPath),
-              Visibility.PRIVATE.getMask(),
-              ForLoadedType.of(void.class),
-              Arrays.asList(
-                  ForLoadedType.of(
-                      mapWriter.getFieldReflectionType().getKey()),
-                  ForLoadedType.of(
-                      mapWriter.getFieldReflectionType().getValue()))));
-          return instrumentedType;
-        }
       }
 
-      abstract class WritAllFieldsImplementation implements Implementation {
+      abstract class FastMessageWriterMethodBase implements Implementation {
         final Implementations steps = new Implementations();
         final LocalVars localVars = new LocalVars();
 
@@ -1819,11 +1918,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
           steps.add(localVars.asImplementation());
           compound = new Implementation.Compound(steps);
-          instrumentedType = registerMethod(instrumentedType);
           return compound.prepare(instrumentedType);
         }
-
-        protected abstract InstrumentedType registerMethod(InstrumentedType instrumentedType);
 
         protected void writeMessageFields(
             MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> regularField) {
@@ -1896,7 +1992,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               } else if (field.isProtoWrapper()) {
                 implementation = writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
               } else if (field.isEnum()) {
-                implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, field);
+                implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
               }
               if (implementation == null) {
                 implementation = notOptimizedField(field);
@@ -2220,7 +2316,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           };
         }
 
-        private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+        private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter> field) {
           return null;
         }
 
@@ -2240,7 +2336,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             @Override
             void convertRawValueAndWrite() {
               add(MethodInvocation.invoke(
-                  fieldPathToMethodDescription.get(field.fieldPath)));
+                  fieldPathToMethodDescriptionMap.get(field.fieldPath)));
             }
 
 
@@ -2399,34 +2495,19 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           methodName = Reflection.FastMessageWriter.writeAllFields.getName();
         } else {
           methodName = Reflection.FastMessageWriter.writeAllFields.getName() + "$"
-              + fieldPathToMethodDescription.size();
+              + fieldPathToMethodDescriptionMap.size();
         }
-        fieldPathToMethodName.put(fieldPath, methodName);
+        fieldPathToMethodNameMap.put(fieldPath, methodName);
 
-        if (!fieldPath.isRoot()) {
-          MethodDescription.Token token = new MethodDescription.Token(
-              methodName,
-              Visibility.PRIVATE.getMask(),
-              ForLoadedType.of(void.class),
-              Arrays.asList(ForLoadedType.of(field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
-                  .get())));
+        MethodDescription.Token token = new MethodDescription.Token(
+            methodName,
+            fieldPath.isRoot() ? Visibility.PUBLIC.getMask() : Visibility.PRIVATE.getMask(),
+            ForLoadedType.of(fieldPath.isRoot() ? boolean.class : void.class),
+            Arrays.asList(ForLoadedType.of(fieldPath.isRoot() ? MessageOrBuilder.class :field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
+                .get())));
 
-          fieldPathToMethodDescriptionToken.put(fieldPath, token);
-          fieldPathToMethodDescription.put(fieldPath, new MethodDescription.Latent(typeDescription, token));
-        }
-      }
-
-      @Override
-      public ByteCodeAppender appender(Target implementationTarget) {
-        return new Appender(implementationTarget);
-      }
-
-      @Override
-      public InstrumentedType prepare(InstrumentedType instrumentedType) {
-        for (Implementation impl : writeAllFieldsMethods.values()) {
-          instrumentedType = impl.prepare(instrumentedType);
-        }
-        return instrumentedType;
+//         fieldPathToMethodDescriptionTokenMap.put(fieldPath, token);
+        fieldPathToMethodDescriptionMap.put(fieldPath, new MethodDescription.Latent(classBuilder[0].toTypeDescription(), token));
       }
 
       static class Implementations implements Implementation {
@@ -2734,30 +2815,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             types.add(var.typeDescription);
           }
           return types;
-        }
-      }
-
-      class Appender implements ByteCodeAppender {
-        final Target implementationTarget;
-
-        Appender(Target implementationTarget) {
-          this.implementationTarget = implementationTarget;
-        }
-
-        /**
-         * This implements the logic of following methods:
-         * {@link MessageWriter#writeAllFields(MessageOrBuilder)}
-         * {@link MapWriter#writeRawValue(Object)}
-         */
-        @Override
-        public Size apply(
-            MethodVisitor methodVisitor,
-            Context implementationContext,
-            MethodDescription instrumentedMethod) {
-          Implementation implementation = writeAllFieldsMethods.get(instrumentedMethod.getName());
-          return implementation
-              .appender(implementationTarget)
-              .apply(methodVisitor, implementationContext, instrumentedMethod);
         }
       }
     }
