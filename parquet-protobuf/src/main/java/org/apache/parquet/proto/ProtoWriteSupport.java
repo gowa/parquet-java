@@ -1803,7 +1803,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       abstract class WritAllFieldsImplementation implements Implementation {
         final Implementations steps = new Implementations();
-        final LocalVars localVars = new LocalVars(steps);
+        final LocalVars localVars = new LocalVars();
 
         Implementation compound;
 
@@ -1817,6 +1817,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           if (compound != null) {
             throw new IllegalStateException();
           }
+          steps.add(localVars.asImplementation());
           compound = new Implementation.Compound(steps);
           instrumentedType = registerMethod(instrumentedType);
           return compound.prepare(instrumentedType);
@@ -2121,7 +2122,102 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         private Implementation writeProtoWrapperField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return null;
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            @Override
+            void convertRawValueAndWrite() {
+              ProtoWriteSupport<?>.FieldWriter fieldWriter = field.rawValueWriter();
+              if (fieldWriter instanceof ProtoWriteSupport<?>.BytesValueWriter) {
+                add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BytesValue.class, "getValue")),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.StringValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(StringValue.class, "getValue")),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.BoolValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BoolValue.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addBoolean)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt32ValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt32Value.class, "getValue")),
+                    Codegen.castIntToLong(),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int32ValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int32Value.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt64ValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt64Value.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int64ValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int64Value.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.FloatValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(FloatValue.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addFloat)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.DoubleValueWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(DoubleValue.class, "getValue")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addDouble)
+                );
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimeWriter) {
+                try (LocalVar timeOfDay = localVars.register(TimeOfDay.class)) {
+                  add(
+                      timeOfDay.store(),
+                      timeOfDay.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getHours")),
+                      timeOfDay.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getMinutes")),
+                      timeOfDay.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getSeconds")),
+                      timeOfDay.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getNanos")),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "of", int.class, int.class, int.class, int.class)),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "toNanoOfDay")),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                  );
+                }
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.DateWriter) {
+                try (LocalVar date = localVars.register(Date.class)) {
+                  add(
+                      date.store(),
+                      date.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getYear")),
+                      date.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getMonth")),
+                      date.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getDay")),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "of", int.class, int.class, int.class)),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "toEpochDay")),
+                      Codegen.castLongToInt(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
+                  );
+                }
+              } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimestampWriter) {
+                add(
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Timestamps.class, "toNanos", Timestamp.class)),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                );
+              } else {
+                throw new IllegalStateException();
+              }
+            }
+          };
         }
 
         private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
@@ -2233,6 +2329,24 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           return new Implementations(MethodReturn.VOID);
         }
 
+        private static StackManipulation castLongToInt() {
+          return castPrimitive(Opcodes.L2I);
+        }
+
+        private static StackManipulation castIntToLong() {
+          return castPrimitive(Opcodes.I2L);
+        }
+
+        private static StackManipulation castPrimitive(int opcode) {
+          return new StackManipulation.AbstractBase() {
+            @Override
+            public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+              methodVisitor.visitInsn(opcode);
+              return Size.ZERO;
+            }
+          };
+        }
+
         private static StackManipulation invokeMethod(Method method) {
           return MethodInvocation.invoke(new MethodDescription.ForLoadedMethod(method));
         }
@@ -2246,18 +2360,18 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               proto3MessageOrBuilderInterface, name, fieldDescriptor, parameters));
         }
 
-        private static Implementation storeRecordConsumer(LocalVar recordConsumerVar) {
-          return new Implementations(
+        private static StackManipulation storeRecordConsumer(LocalVar recordConsumerVar) {
+          return new StackManipulation.Compound(
               MethodVariableAccess.loadThis(),
               invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.getRecordConsumer),
               recordConsumerVar.store());
         }
 
-        private static Implementation castToProto3MessageOrBuilderInterface(
+        private static StackManipulation castToProto3MessageOrBuilderInterface(
             LocalVar dest,
             LocalVar src,
             Class<? extends MessageOrBuilder> proto3MessageOrBuilderInterface) {
-          return new Implementations(
+          return new StackManipulation.Compound(
               src.load(),
               TypeCasting.to(TypeDescription.ForLoadedType.of(proto3MessageOrBuilderInterface)),
               dest.store());
@@ -2317,6 +2431,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       static class Implementations implements Implementation {
         final List<Implementation> implementations = new ArrayList<>();
+        final List<StackManipulation> ongoing = new ArrayList<>();
 
         Implementation compound;
 
@@ -2344,11 +2459,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           if (compound != null) {
             throw new IllegalStateException();
           }
+          flushOngoing();
           compound = new Implementation.Compound(implementations);
           return compound.prepare(instrumentedType);
         }
 
         public Implementations add(Implementation... implementations) {
+          flushOngoing();
           this.implementations.addAll(Arrays.asList(implementations));
           return this;
         }
@@ -2358,28 +2475,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         public Implementations add(StackManipulation... stackManipulations) {
-          return add(new Implementation.Simple(stackManipulations));
-        }
-      }
-
-      static class StackManipulations extends StackManipulation.AbstractBase {
-        final List<StackManipulation> stackManipulations = new ArrayList<>();
-
-        StackManipulations() {}
-
-        StackManipulations(StackManipulation... stackManipulations) {
-          add(stackManipulations);
-        }
-
-        @Override
-        public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
-          return new StackManipulation.Compound(stackManipulations)
-              .apply(methodVisitor, implementationContext);
-        }
-
-        public StackManipulations add(StackManipulation... stackManipulations) {
-          this.stackManipulations.addAll(Arrays.asList(stackManipulations));
+          ongoing.addAll(Arrays.asList(stackManipulations));
           return this;
+        }
+
+        private void flushOngoing() {
+          if (!ongoing.isEmpty()) {
+            implementations.add(new Implementation.Simple(ongoing.toArray(new StackManipulation[0])));
+            ongoing.clear();
+          }
         }
       }
 
@@ -2483,13 +2587,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       static class LocalVars {
-        final Implementations steps;
         final List<TypeDescription> frame = new ArrayList<>();
         List<LocalVar> vars = new ArrayList<>();
-
-        LocalVars(Implementations steps) {
-          this.steps = steps;
-        }
+        int maxSize;
 
         LocalVar register(LocalVar var) {
           if (vars.contains(var)) {
@@ -2501,8 +2601,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           var.offset = offset;
           var.refCount = 1;
 
-          steps.add(asImplementation());
-
+          maxSize = Math.max(maxSize, getSize());
           return var;
         }
 
@@ -2610,14 +2709,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         Implementation asImplementation() {
-          int size = getSize();
-          return new Implementations(new ByteCodeAppender() {
+          return new Implementation.Simple(new ByteCodeAppender() {
             @Override
             public Size apply(
                 MethodVisitor methodVisitor,
                 Context implementationContext,
                 MethodDescription instrumentedMethod) {
-              return new Size(0, size);
+              return new Size(0, maxSize);
             }
           });
         }
