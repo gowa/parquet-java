@@ -84,10 +84,13 @@ import net.bytebuddy.implementation.Implementation.Context;
 import net.bytebuddy.implementation.MethodCall;
 import net.bytebuddy.implementation.SuperMethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
+import net.bytebuddy.implementation.bytecode.Removal;
 import net.bytebuddy.implementation.bytecode.StackManipulation;
 import net.bytebuddy.implementation.bytecode.StackSize;
 import net.bytebuddy.implementation.bytecode.assign.InstanceCheck;
 import net.bytebuddy.implementation.bytecode.assign.TypeCasting;
+import net.bytebuddy.implementation.bytecode.collection.ArrayAccess;
+import net.bytebuddy.implementation.bytecode.collection.ArrayFactory;
 import net.bytebuddy.implementation.bytecode.constant.IntegerConstant;
 import net.bytebuddy.implementation.bytecode.constant.TextConstant;
 import net.bytebuddy.implementation.bytecode.member.FieldAccess;
@@ -98,6 +101,7 @@ import net.bytebuddy.jar.asm.Label;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.matcher.ElementMatchers;
+import net.bytebuddy.utility.ConstantValue;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -1780,7 +1784,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), new FieldDescription.Token(
               "enumValues" + enumTypeFieldIdx,
               Modifier.PRIVATE | Modifier.FINAL,
-              TypeDescription.Generic.Builder.parameterizedType(List.class, Descriptors.EnumValueDescriptor.class).build()))
+              TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)))
           );
         }
 
@@ -1868,6 +1872,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                     .filter(ElementMatchers.named("enumDescriptor" + idx))
                     .getOnly()).read(),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "getValues")),
+                ArrayFactory.forType(TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)).withValues(Collections.emptyList()),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(List.class, "toArray", Object[].class)),
+                TypeCasting.to(TypeDescription.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)),
                 FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
                     .filter(ElementMatchers.named("enumValues" + idx))
                     .getOnly()).write()
@@ -2317,7 +2324,92 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter> field) {
-          return null;
+          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
+            String getterMethodTemplate() {
+              return "get{}Value";
+            }
+
+            /**
+             *         int enumNumber = getEnumValue.getValue(object);
+             *         ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
+             *         Enum<?> javaEnum = (Enum<?>) enum_;
+             *         Descriptors.EnumValueDescriptor enumValueDescriptor;
+             *         if (javaEnum != null) {
+             *           enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+             *         } else {
+             *           enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
+             *         }
+             */
+            @Override
+            void convertRawValueAndWrite() {
+              ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
+              String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
+
+              try(LocalVar enumNumber = localVars.register(int.class)) {
+                Class<?> enumClass = enumTypeFullNameToClassMap.get(enumTypeFullName);
+                add(enumNumber.store(),
+                    enumNumber.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumClass, "forNumber", int.class))
+                );
+                try (LocalVar enumRef = localVars.register(enumClass)) {
+                  enumRef.store();
+                  enumRef.load();
+                  Label ifEnumRefIsNull = new Label();
+                  Label afterEnumValueResolved = new Label();
+                  add(Codegen.jumpTo(Opcodes.IFNULL, ifEnumRefIsNull),
+                      MethodVariableAccess.loadThis(),
+                      FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                          .filter(ElementMatchers.named("enumValues" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                          .getOnly()).read(),
+                      enumRef.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(java.lang.Enum.class, "ordinal")),
+                      ArrayAccess.REFERENCE.load(),
+                      Codegen.jumpTo(Opcodes.GOTO, afterEnumValueResolved),
+                      Codegen.visitLabel(ifEnumRefIsNull),
+                      localVars.frameEmptyStack(),
+                      MethodVariableAccess.loadThis(),
+                      FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                          .filter(ElementMatchers.named("enumDescriptor" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                          .getOnly()).read(),
+                      enumNumber.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "findValueByNumberCreatingIfUnknown", int.class)),
+                      Codegen.visitLabel(afterEnumValueResolved),
+                      localVars.frameSame1(Descriptors.EnumValueDescriptor.class)
+                      );
+
+                    try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
+                      add(enumValueDesc.store());
+                      try (LocalVar enumValueDescName = localVars.register(String.class)) {
+                        add(enumValueDesc.load(),
+                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
+                            enumValueDescName.store(),
+                            enumValueDescName.load(),
+                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
+                        );
+                        try (LocalVar binary = localVars.register(Binary.class)) {
+                          add(binary.store(),
+                              recordConsumerVar.load(),
+                              binary.load(),
+                              Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
+                              MethodVariableAccess.loadThis(),
+                              FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                                  .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                                  .getOnly()).read(),
+                              enumValueDescName.load(),
+                              enumValueDesc.load(),
+                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
+                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
+                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
+                              Removal.SINGLE
+                          );
+                        }
+                      }
+                    }
+
+                }
+              }
+            }
+          };
         }
 
         private Implementation writeMessageField(
@@ -2684,6 +2776,24 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           maxSize = Math.max(maxSize, getSize());
           return var;
+        }
+
+        StackManipulation frameSame1(Class<?> varOnStack) {
+          List<TypeDescription> currTypes = types();
+          try {
+            return new StackManipulation.AbstractBase() {
+              @Override
+              public Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                implementationContext
+                    .getFrameGeneration()
+                    .same1(methodVisitor, TypeDescription.ForLoadedType.of(varOnStack), currTypes);
+                return Size.ZERO;
+              }
+            };
+          } finally {
+            this.frame.clear();
+            this.frame.addAll(currTypes);
+          }
         }
 
         StackManipulation frameEmptyStack() {
