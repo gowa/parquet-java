@@ -101,7 +101,6 @@ import net.bytebuddy.jar.asm.Label;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.matcher.ElementMatchers;
-import net.bytebuddy.utility.ConstantValue;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -1506,6 +1505,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           super(fieldPath, owningType, fieldWriter);
         }
 
+        @Override
+        public String toString() {
+          return "RegularField{" +
+              "fieldPath=" + fieldPath +
+              ", owningType=" + owningType +
+              ", fieldWriter=" + fieldWriter +
+              '}';
+        }
+
         ProtoWriteSupport<?>.FieldWriter rawValueWriter() {
           if (fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter) {
             return ((ProtoWriteSupport<?>.ArrayWriter) fieldWriter).fieldWriter;
@@ -1677,7 +1685,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             if (valueField.isMessage()) {
               if (visitor.visitMapMessageWriter(mapField)) {
                 queue.add(new FieldPathAndMessageWriter(
-                    mapField.fieldPath,
+                    mapField.fieldPath.push("value"),
                     (ProtoWriteSupport<?>.MessageWriter) mapField.fieldWriter.valueWriter));
               }
             } else {
@@ -1709,9 +1717,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final List<ProtoWriteSupport<?>.MessageWriter> notOptimizedMessageWriters = new ArrayList<>();
 
       final Map<FieldPath, String> fieldPathToMethodNameMap = new HashMap<>();
-//       final Map<FieldPath, MethodDescription.Token> fieldPathToMethodDescriptionTokenMap = new HashMap<>();
       final Map<FieldPath, MethodDescription> fieldPathToMethodDescriptionMap = new HashMap<>();
-//       final Map<String, Implementation> writeAllFieldsMethodsMap = new HashMap<>();
+
+      final Map<FieldPath, String> mapFieldPathToMethodNameMap = new HashMap<>();
+      final Map<FieldPath, MethodDescription> mapFieldPathToMethodDescriptionMap = new HashMap<>();
 
       final Map<String, Integer> enumTypeFullNameToFieldIdx = new HashMap<>();
       final Map<String, Class<?>> enumTypeFullNameToClassMap = new HashMap<>();
@@ -1750,6 +1759,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public void visitNonMessageWriter(RegularField<?> field) {
+            maybeRegisterEnum(field);
+          }
+
+          private void maybeRegisterEnum(RegularField<?> field) {
             if (field.isEnum()) {
               ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
               String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
@@ -1761,7 +1774,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            return false;
+            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) && !field.value().isBinaryMessage()) {
+              registerWriteMapEntry(field);
+              maybeRegisterEnum(field.value());
+            }
+            return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
           }
         });
 
@@ -1810,18 +1827,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-/*
-            classBuilder[0] = classBuilder[0].define(new MethodDescription.Latent(classBuilder[0].toTypeDescription(), new MethodDescription.Token(
-                fieldPathToMethodNameMap.get(field.fieldPath),
-                Visibility.PRIVATE.getMask(),
-                ForLoadedType.of(void.class),
-                Arrays.asList(
-                    ForLoadedType.of(
-                        field.fieldWriter.getFieldReflectionType().getKey()),
-                    ForLoadedType.of(
-                        field.fieldWriter.getFieldReflectionType().getValue()))))).intercept(NOOP);
-*/
-
+            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) && !field.value().isBinaryMessage()) {
+              classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
+              return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
+            }
             return false;
           }
         });
@@ -1829,10 +1838,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> make() {
         return classBuilder[0].make();
-      }
-
-      boolean unwrapProtoWrappers() {
-        return protoWriteSupport.unwrapProtoWrappers;
       }
 
       boolean writeSpecsCompliant() {
@@ -1898,12 +1903,52 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       class WriteAllFieldsForMapEntryImplementation extends FastMessageWriterMethodBase {
-        final FieldPath fieldPath;
-        final ProtoWriteSupport<?>.MapWriter mapWriter;
+        final MessageWriterVisitor.MapField field;
 
-        WriteAllFieldsForMapEntryImplementation(FieldPath fieldPath, ProtoWriteSupport<?>.MapWriter mapWriter) {
-          this.fieldPath = fieldPath;
-          this.mapWriter = mapWriter;
+        WriteAllFieldsForMapEntryImplementation(MessageWriterVisitor.MapField field) {
+          this.field = field;
+
+          try (LocalVar thisLocalVar = localVars.register(classBuilder[0].toTypeDescription())) {
+            try (LocalVar key = localVars.register(field.key().getFieldReflectionType())) {
+              try (LocalVar value = localVars.register(field.value().isEnum() ? int.class : field.value().getFieldReflectionType())) {
+                try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
+                  steps.add(Codegen.storeRecordConsumer(recordConsumerVar));
+                  steps.add(
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.startGroup)
+                  );
+                  steps.add(writeFromVar(field.key(), key, recordConsumerVar));
+//                   if (field.value().isMessage()) {
+//                     writeMessageFieldsInternal(value, recordConsumerVar, (MessageWriterVisitor.RegularField) field.value());
+//                   } else {
+                  steps.add(writeFromVar(field.value(), value, recordConsumerVar));
+//                   }
+                  steps.add(
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+                  );
+                  steps.add(Codegen.returnVoid());
+                }
+              }
+            }
+          }
+        }
+
+        Implementation writeFromVar(MessageWriterVisitor.RegularField<?> field, LocalVar val, LocalVar recordConsumer) {
+          if (field.isEnum()) {
+            return new EnumFieldWriter((MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field, recordConsumer).writeFromVar(val);
+          } else if (field.isMessage()) {
+            return new MessageFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isString()) {
+            return new StringFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isBinary()) {
+            return new BinaryFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isProtoWrapper()) {
+            return new ProtoWrapperFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isPrimitive()) {
+            return new PrimitiveFieldWriter(field, recordConsumer).writeFromVar(val);
+          }
+          throw new IllegalStateException("field: " + field);
         }
       }
 
@@ -1953,8 +1998,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               }
               try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
                 steps.add(Codegen.storeRecordConsumer(recordConsumerVar));
-
-                writeMessageFieldsInternal(proto3MessageOrBuilder, recordConsumerVar, regularField);
+                steps.add(new MessageFieldWriter(regularField, recordConsumerVar).writeMessageFieldsInternal(proto3MessageOrBuilder));
               }
             }
 
@@ -1966,81 +2010,22 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
         }
 
-        protected void writeMessageFieldsInternal(
-            LocalVar proto3MessageOrBuilder,
-            LocalVar recordConsumerVar,
-            MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start) {
-
-          MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
-            @Override
-            public boolean visitMessageWriter(RegularField<?> field) {
-              if (field == start) {
-                return true;
-              }
-              Implementation implementation =
-                  writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
-              if (implementation == null) {
-                implementation = notOptimizedField(field);
-              }
-              steps.add(implementation);
-              return false;
-            }
-
-            @Override
-            public void visitNonMessageWriter(
-                RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-              Implementation implementation = null;
-              if (field.isPrimitive()) {
-                implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
-              } else if (field.isBinary()) {
-                implementation = writeBinaryField(proto3MessageOrBuilder, recordConsumerVar, field);
-              } else if (field.isString()) {
-                implementation = writeStringField(proto3MessageOrBuilder, recordConsumerVar, field);
-              } else if (field.isProtoWrapper()) {
-                implementation = writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
-              } else if (field.isEnum()) {
-                implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
-              }
-              if (implementation == null) {
-                implementation = notOptimizedField(field);
-              }
-              steps.add(implementation);
-            }
-
-            @Override
-            public boolean visitMapMessageWriter(MapField field) {
-              steps.add(notOptimizedField(field));
-              return false;
-            }
-
-            @Override
-            public void visitMapNonMessageWriter(MapField field) {
-              steps.add(notOptimizedField(field));
-            }
-          });
-        }
-
-        private Implementation notOptimizedField(MessageWriterVisitor.Field<?> field) {
-          Implementation implementation;
-          JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-              JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                  field.getOwningTypeProto3MessageOrBuilderInterface()
-                      .get(),
-                  field.fieldWriter);
-
-          implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-              .on(fieldOfObjectWriter)
-              .withArgument(0)
-              .andThen(NOOP);
-          return implementation;
-        }
-
         abstract class RegularFieldWriterTemplate extends Implementations {
+          final MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field;
+          final LocalVar recordConsumerVar;
+
+          RegularFieldWriterTemplate(
+              MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+              LocalVar recordConsumerVar) {
+            this.field = field;
+            this.recordConsumerVar = recordConsumerVar;
+          }
+
           String getterMethodTemplate() {
             return "get{}";
           }
 
-          RegularFieldWriterTemplate(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+          Implementation fieldGetConvertWrite(LocalVar proto3MessageOrBuilder) {
             if (field.isRepeated()) {
               Label afterIfCountGreaterThanZero = new Label();
               try (LocalVar countVar = localVars.register(int.class)) {
@@ -2090,7 +2075,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                         Codegen.invokeMethod(Reflection.RecordConsumer.startField));
                   }
 
-                  writeRepeatedRawValue(proto3MessageOrBuilder, recordConsumerVar, field, iVar);
+                  writeRepeatedRawValue(proto3MessageOrBuilder, iVar);
 
                   if (writeSpecsCompliant()) {
                     add(
@@ -2141,7 +2126,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                   Codegen.invokeMethod(Reflection.RecordConsumer.startField)
               );
 
-              writeRawValue(proto3MessageOrBuilder, recordConsumerVar, field);
+              writeRawValue(proto3MessageOrBuilder);
 
               add(recordConsumerVar.load(),
                   new TextConstant(field.fieldWriter.fieldName),
@@ -2152,28 +2137,56 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 add(Codegen.visitLabel(afterEndField), localVars.frameEmptyStack());
               }
             }
+
+            return this;
           }
 
-          void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                 MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-                                 LocalVar iVar) {
-            // load i-th repeated value
+          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
             add(recordConsumerVar.load(),
                 proto3MessageOrBuilder.load(),
                 iVar.load(),
                 Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
-
-            convertRawValueAndWrite();
           }
 
-          void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                 MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-            // load value on stack
+          void afterConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+          }
+
+          void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            beforeConvertRepeatedValue(proto3MessageOrBuilder, iVar);
+            convertRawValueAndWrite();
+            afterConvertRepeatedValue(proto3MessageOrBuilder, iVar);
+          }
+
+          Implementation writeFromVar(LocalVar var) {
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+            );
+            add(recordConsumerVar.load(),
+                var.load());
+            convertRawValueAndWrite();
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.endField)
+            );
+            return this;
+          }
+
+          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
             add(recordConsumerVar.load(),
                 proto3MessageOrBuilder.load(),
                 Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
+          }
 
+          void afterConvertSingleValue(LocalVar proto3MessageOrBuilder) {
+          }
+
+          void writeRawValue(LocalVar proto3MessageOrBuilder) {
+            beforeConvertSingleValue(proto3MessageOrBuilder);
             convertRawValueAndWrite();
+            afterConvertSingleValue(proto3MessageOrBuilder);
           }
 
           abstract void convertRawValueAndWrite();
@@ -2183,255 +2196,23 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             LocalVar proto3MessageOrBuilder,
             LocalVar recordConsumerVar,
             MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            @Override
-            void convertRawValueAndWrite() {
-              add(Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get( field.getFieldReflectionType())));
-            }
-          };
+          return new PrimitiveFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
         private Implementation writeBinaryField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          /*
-      ByteString byteString = (ByteString) value;
-      Binary binary = Binary.fromConstantByteArray(byteString.toByteArray());
-      recordConsumer.addBinary(binary);
-
-           */
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            @Override
-            void convertRawValueAndWrite() {
-              add(
-                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
-                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
-              );
-            }
-          };
+          return new BinaryFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
         private Implementation writeStringField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          /*
-      Binary binaryString = Binary.fromString((String) value);
-      recordConsumer.addBinary(binaryString);
-           */
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            @Override
-            void convertRawValueAndWrite() {
-              add(Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary));
-            }
-          };
+          return new StringFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
         private Implementation writeProtoWrapperField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            @Override
-            void convertRawValueAndWrite() {
-              ProtoWriteSupport<?>.FieldWriter fieldWriter = field.rawValueWriter();
-              if (fieldWriter instanceof ProtoWriteSupport<?>.BytesValueWriter) {
-                add(
-                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BytesValue.class, "getValue")),
-                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
-                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.StringValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(StringValue.class, "getValue")),
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.BoolValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BoolValue.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addBoolean)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt32ValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt32Value.class, "getValue")),
-                    Codegen.castIntToLong(),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int32ValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int32Value.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt64ValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt64Value.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int64ValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int64Value.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.FloatValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(FloatValue.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addFloat)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.DoubleValueWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(DoubleValue.class, "getValue")),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addDouble)
-                );
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimeWriter) {
-                try (LocalVar timeOfDay = localVars.register(TimeOfDay.class)) {
-                  add(
-                      timeOfDay.store(),
-                      timeOfDay.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getHours")),
-                      timeOfDay.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getMinutes")),
-                      timeOfDay.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getSeconds")),
-                      timeOfDay.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getNanos")),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "of", int.class, int.class, int.class, int.class)),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "toNanoOfDay")),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
-                  );
-                }
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.DateWriter) {
-                try (LocalVar date = localVars.register(Date.class)) {
-                  add(
-                      date.store(),
-                      date.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getYear")),
-                      date.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getMonth")),
-                      date.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getDay")),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "of", int.class, int.class, int.class)),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "toEpochDay")),
-                      Codegen.castLongToInt(),
-                      Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
-                  );
-                }
-              } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimestampWriter) {
-                add(
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Timestamps.class, "toNanos", Timestamp.class)),
-                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
-                );
-              } else {
-                throw new IllegalStateException();
-              }
-            }
-          };
+          return new ProtoWrapperFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
         private Implementation writeEnumField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar, MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter> field) {
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            String getterMethodTemplate() {
-              return "get{}Value";
-            }
-
-            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                       MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-                                       LocalVar iVar) {
-              // load i-th repeated value
-              add(proto3MessageOrBuilder.load(),
-                  iVar.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
-
-              convertRawValueAndWrite();
-            }
-
-            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                               MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-              // load value on stack
-              add(proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
-
-              convertRawValueAndWrite();
-            }
-
-
-            /**
-             *         int enumNumber = getEnumValue.getValue(object);
-             *         ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
-             *         Enum<?> javaEnum = (Enum<?>) enum_;
-             *         Descriptors.EnumValueDescriptor enumValueDescriptor;
-             *         if (javaEnum != null) {
-             *           enumValueDescriptor = enumValues.get(javaEnum.ordinal());
-             *         } else {
-             *           enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
-             *         }
-             */
-            @Override
-            void convertRawValueAndWrite() {
-              ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
-              String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
-
-              try(LocalVar enumNumber = localVars.register(int.class)) {
-                Class<?> enumClass = enumTypeFullNameToClassMap.get(enumTypeFullName);
-                add(enumNumber.store(),
-                    enumNumber.load(),
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumClass, "forNumber", int.class))
-                );
-                try (LocalVar enumRef = localVars.register(enumClass)) {
-                  add(
-                      enumRef.store(),
-                      enumRef.load()
-                  );
-                  Label ifEnumRefIsNull = new Label();
-                  Label afterEnumValueResolved = new Label();
-                  add(Codegen.jumpTo(Opcodes.IFNULL, ifEnumRefIsNull),
-                      MethodVariableAccess.loadThis(),
-                      FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                          .filter(ElementMatchers.named("enumValues" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                          .getOnly()).read(),
-                      enumRef.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(java.lang.Enum.class, "ordinal")),
-                      ArrayAccess.REFERENCE.load(),
-                      Codegen.jumpTo(Opcodes.GOTO, afterEnumValueResolved),
-                      Codegen.visitLabel(ifEnumRefIsNull),
-                      localVars.frameEmptyStack(),
-                      MethodVariableAccess.loadThis(),
-                      FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                          .filter(ElementMatchers.named("enumDescriptor" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                          .getOnly()).read(),
-                      enumNumber.load(),
-                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "findValueByNumberCreatingIfUnknown", int.class)),
-                      Codegen.visitLabel(afterEnumValueResolved),
-                      localVars.frameSame1(Descriptors.EnumValueDescriptor.class)
-                      );
-
-                  try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
-                    add(enumValueDesc.store());
-                    try (LocalVar enumValueDescName = localVars.register(String.class)) {
-                      add(enumValueDesc.load(),
-                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
-                          enumValueDescName.store(),
-                          enumValueDescName.load(),
-                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
-                      );
-                      try (LocalVar binary = localVars.register(Binary.class)) {
-                        add(binary.store(),
-                            recordConsumerVar.load(),
-                            binary.load(),
-                            Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
-                            MethodVariableAccess.loadThis(),
-                            FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                                .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                                .getOnly()).read(),
-                            enumValueDescName.load(),
-                            enumValueDesc.load(),
-                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
-                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
-                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
-                            Removal.SINGLE
-                        );
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          };
+          return new EnumFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
         private Implementation writeMessageField(
@@ -2442,56 +2223,450 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               .isPresent()) {
             return null;
           }
-          return new RegularFieldWriterTemplate(proto3MessageOrBuilder, recordConsumerVar, field) {
-            String getterMethodTemplate() {
-              return "get{}OrBuilder";
-            }
+          return new MessageFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
+        }
 
-            @Override
-            void convertRawValueAndWrite() {
-              add(MethodInvocation.invoke(
-                  fieldPathToMethodDescriptionMap.get(field.fieldPath)));
-            }
+        class PrimitiveFieldWriter extends RegularFieldWriterTemplate {
+          public PrimitiveFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                      LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
 
+          @Override
+          void convertRawValueAndWrite() {
+            add(Codegen.invokeMethod(Reflection.RecordConsumer.PRIMITIVES.get(field.getFieldReflectionType())));
+          }
+        }
 
-            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                       MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-                                       LocalVar iVar) {
-              startGroup();
-              add(proto3MessageOrBuilder.load(),
-                  iVar.load(),
-                  Codegen.invokeProtoMethod(
-                      proto3MessageOrBuilder.clazz(),
-                      getterMethodTemplate(),
-                      field.protoDescriptor(),
-                      int.class));
-              convertRawValueAndWrite();
-              endGroup();
-            }
+        class MessageFieldWriter extends RegularFieldWriterTemplate {
 
-            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                               MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-              startGroup();
-              add(proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(
-                      proto3MessageOrBuilder.clazz(),
-                      getterMethodTemplate(),
-                      field.protoDescriptor()));
-              convertRawValueAndWrite();
-              endGroup();
-            }
+          MessageFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                             LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
 
-            void startGroup() {
-              add(recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
-                  MethodVariableAccess.loadThis());
-            }
+          String getterMethodTemplate() {
+            return "get{}OrBuilder";
+          }
 
-            void endGroup() {
-              add(recordConsumerVar.load(),
-                  Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
+          @Override
+          void convertRawValueAndWrite() {
+            MethodDescription methodDescription = fieldPathToMethodDescriptionMap.get(field.fieldPath);
+            if (methodDescription == null) {
+              throw new IllegalStateException("field: " + field);
             }
-          };
+            add(MethodInvocation.invoke(
+                methodDescription));
+          }
+
+          @Override
+          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            startGroup();
+            add(MethodVariableAccess.loadThis(),
+                proto3MessageOrBuilder.load(),
+                iVar.load(),
+                Codegen.invokeProtoMethod(
+                    proto3MessageOrBuilder.clazz(),
+                    getterMethodTemplate(),
+                    field.protoDescriptor(),
+                    int.class));
+          }
+
+          @Override
+          void afterConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            endGroup();
+          }
+
+          Implementation writeFromVar(LocalVar var) {
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+            );
+            startGroup();
+//             add(var.load());
+            writeMessageFieldsInternal(var);
+//             convertRawValueAndWrite();
+            endGroup();
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.endField)
+            );
+            return this;
+          }
+
+          @Override
+          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
+            startGroup();
+
+            add(MethodVariableAccess.loadThis(),
+                proto3MessageOrBuilder.load(),
+                Codegen.invokeProtoMethod(
+                    proto3MessageOrBuilder.clazz(),
+                    getterMethodTemplate(),
+                    field.protoDescriptor()));
+          }
+
+          @Override
+          void afterConvertSingleValue(LocalVar proto3MessageOrBuilder) {
+            endGroup();
+          }
+
+          void startGroup() {
+            add(recordConsumerVar.load(),
+                Codegen.invokeMethod(Reflection.RecordConsumer.startGroup));
+          }
+
+          void endGroup() {
+            add(recordConsumerVar.load(),
+                Codegen.invokeMethod(Reflection.RecordConsumer.endGroup));
+          }
+
+          Implementation writeMessageFieldsInternal(
+              LocalVar proto3MessageOrBuilder) {
+
+            MessageWriterVisitor.traverse((MessageWriterVisitor.RegularField) field, new MessageWriterVisitor() {
+              @Override
+              public boolean visitMessageWriter(RegularField<?> field) {
+                if (field == MessageFieldWriter.this.field) {
+                  return true;
+                }
+                Implementation implementation = writeMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar);
+                add(implementation);
+                return false;
+              }
+
+              @Override
+              public void visitNonMessageWriter(
+                  RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+                Implementation implementation = writeNonMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar);
+                add(implementation);
+              }
+
+              @Override
+              public boolean visitMapMessageWriter(MapField field) {
+                add(notOptimizedField(field));
+                return false;
+              }
+
+              @Override
+              public void visitMapNonMessageWriter(MapField field) {
+                add(notOptimizedField(field));
+              }
+            });
+
+            return this;
+          }
+
+          protected Implementation writeNonMessageRegularField(
+              MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+              LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
+            Implementation implementation = null;
+            if (field.isPrimitive()) {
+              implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
+            } else if (field.isBinary()) {
+              implementation = writeBinaryField(proto3MessageOrBuilder, recordConsumerVar, field);
+            } else if (field.isString()) {
+              implementation = writeStringField(proto3MessageOrBuilder, recordConsumerVar, field);
+            } else if (field.isProtoWrapper()) {
+              implementation = writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
+            } else if (field.isEnum()) {
+              implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
+            }
+            if (implementation == null) {
+              implementation = notOptimizedField(field);
+            }
+            return implementation;
+          }
+
+          protected Implementation writeMessageRegularField(MessageWriterVisitor.RegularField<?> field,
+                                                            LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
+            Implementation implementation =
+                writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
+            if (implementation == null) {
+              implementation = notOptimizedField(field);
+            }
+            return implementation;
+          }
+
+          protected Implementation notOptimizedField(MessageWriterVisitor.Field<?> field) {
+            Implementation implementation;
+            JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
+                JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
+                    field.getOwningTypeProto3MessageOrBuilderInterface()
+                        .get(),
+                    field.fieldWriter);
+
+            implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
+                .on(fieldOfObjectWriter)
+                .withArgument(0)
+                .andThen(NOOP);
+            return implementation;
+          }
+        }
+
+        class BinaryFieldWriter extends RegularFieldWriterTemplate {
+          BinaryFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                            LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
+          /*
+            ByteString byteString = (ByteString) value;
+            Binary binary = Binary.fromConstantByteArray(byteString.toByteArray());
+            recordConsumer.addBinary(binary);
+          */
+
+          @Override
+          void convertRawValueAndWrite() {
+            add(
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
+                Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+            );
+          }
+        }
+
+        class StringFieldWriter extends RegularFieldWriterTemplate {
+          StringFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                    LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
+
+          /*
+            Binary binaryString = Binary.fromString((String) value);
+            recordConsumer.addBinary(binaryString);
+          */
+          @Override
+          void convertRawValueAndWrite() {
+            add(Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
+                Codegen.invokeMethod(Reflection.RecordConsumer.addBinary));
+          }
+        }
+
+        class ProtoWrapperFieldWriter extends RegularFieldWriterTemplate {
+          ProtoWrapperFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                         LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
+
+          @Override
+          void convertRawValueAndWrite() {
+            ProtoWriteSupport<?>.FieldWriter fieldWriter = field.rawValueWriter();
+            if (fieldWriter instanceof ProtoWriteSupport<?>.BytesValueWriter) {
+              add(
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BytesValue.class, "getValue")),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteString.class, "toByteArray")),
+                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromConstantByteArray", byte[].class)),
+                Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.StringValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(StringValue.class, "getValue")),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class)),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.BoolValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(BoolValue.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addBoolean)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt32ValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt32Value.class, "getValue")),
+                  Codegen.castIntToLong(),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int32ValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int32Value.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.UInt64ValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(UInt64Value.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.Int64ValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Int64Value.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.FloatValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(FloatValue.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addFloat)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.DoubleValueWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(DoubleValue.class, "getValue")),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addDouble)
+              );
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimeWriter) {
+              try (LocalVar timeOfDay = localVars.register(TimeOfDay.class)) {
+                add(
+                    timeOfDay.store(),
+                    timeOfDay.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getHours")),
+                    timeOfDay.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getMinutes")),
+                    timeOfDay.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getSeconds")),
+                    timeOfDay.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(TimeOfDay.class, "getNanos")),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "of", int.class, int.class, int.class, int.class)),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalTime.class, "toNanoOfDay")),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+                );
+              }
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.DateWriter) {
+              try (LocalVar date = localVars.register(Date.class)) {
+                add(
+                    date.store(),
+                    date.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getYear")),
+                    date.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getMonth")),
+                    date.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getDay")),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "of", int.class, int.class, int.class)),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "toEpochDay")),
+                    Codegen.castLongToInt(),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.addInteger)
+                );
+              }
+            } else if (fieldWriter instanceof ProtoWriteSupport<?>.TimestampWriter) {
+              add(
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Timestamps.class, "toNanos", Timestamp.class)),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.addLong)
+              );
+            } else {
+              throw new IllegalStateException();
+            }
+          }
+        }
+
+        class EnumFieldWriter extends RegularFieldWriterTemplate {
+
+          EnumFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter> field,
+                                 LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
+          }
+
+          String getterMethodTemplate() {
+            return "get{}Value";
+          }
+
+          @Override
+          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            add(proto3MessageOrBuilder.load(),
+                iVar.load(),
+                Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
+          }
+
+          Implementation writeFromVar(LocalVar var) {
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+            );
+            add(var.load());
+            convertRawValueAndWrite();
+            add(recordConsumerVar.load(),
+                new TextConstant(field.parquetFieldName()),
+                IntegerConstant.forValue(field.parquetFieldIndex()),
+                Codegen.invokeMethod(Reflection.RecordConsumer.endField)
+            );
+            return this;
+          }
+
+          @Override
+          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
+            add(proto3MessageOrBuilder.load(),
+                Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
+          }
+
+          /**
+           *         int enumNumber = getEnumValue.getValue(object);
+           *         ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
+           *         Enum<?> javaEnum = (Enum<?>) enum_;
+           *         Descriptors.EnumValueDescriptor enumValueDescriptor;
+           *         if (javaEnum != null) {
+           *           enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+           *         } else {
+           *           enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
+           *         }
+           */
+          @Override
+          void convertRawValueAndWrite() {
+            ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
+            String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
+
+            try(LocalVar enumNumber = localVars.register(int.class)) {
+              Class<?> enumClass = enumTypeFullNameToClassMap.get(enumTypeFullName);
+              add(enumNumber.store(),
+                  enumNumber.load(),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumClass, "forNumber", int.class))
+              );
+              try (LocalVar enumRef = localVars.register(enumClass)) {
+                add(
+                    enumRef.store(),
+                    enumRef.load()
+                );
+                Label ifEnumRefIsNull = new Label();
+                Label afterEnumValueResolved = new Label();
+                add(Codegen.jumpTo(Opcodes.IFNULL, ifEnumRefIsNull),
+                    MethodVariableAccess.loadThis(),
+                    FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                        .filter(ElementMatchers.named("enumValues" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                        .getOnly()).read(),
+                    enumRef.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Enum.class, "ordinal")),
+                    ArrayAccess.REFERENCE.load(),
+                    Codegen.jumpTo(Opcodes.GOTO, afterEnumValueResolved),
+                    Codegen.visitLabel(ifEnumRefIsNull),
+                    localVars.frameEmptyStack(),
+                    MethodVariableAccess.loadThis(),
+                    FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                        .filter(ElementMatchers.named("enumDescriptor" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                        .getOnly()).read(),
+                    enumNumber.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "findValueByNumberCreatingIfUnknown", int.class)),
+                    Codegen.visitLabel(afterEnumValueResolved),
+                    localVars.frameSame1(Descriptors.EnumValueDescriptor.class)
+                    );
+
+                try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
+                  add(enumValueDesc.store());
+                  try (LocalVar enumValueDescName = localVars.register(String.class)) {
+                    add(enumValueDesc.load(),
+                        Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
+                        enumValueDescName.store(),
+                        enumValueDescName.load(),
+                        Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
+                    );
+                    try (LocalVar binary = localVars.register(Binary.class)) {
+                      add(binary.store(),
+                          recordConsumerVar.load(),
+                          binary.load(),
+                          Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
+                          MethodVariableAccess.loadThis(),
+                          FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                              .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                              .getOnly()).read(),
+                          enumValueDescName.load(),
+                          enumValueDesc.load(),
+                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
+                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
+                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
+                          Removal.SINGLE
+                      );
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
@@ -2620,8 +2795,22 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             Arrays.asList(ForLoadedType.of(fieldPath.isRoot() ? MessageOrBuilder.class :field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
                 .get())));
 
-//         fieldPathToMethodDescriptionTokenMap.put(fieldPath, token);
         fieldPathToMethodDescriptionMap.put(fieldPath, new MethodDescription.Latent(classBuilder[0].toTypeDescription(), token));
+      }
+
+      private void registerWriteMapEntry(MessageWriterVisitor.MapField field) {
+        String methodName = "writeMapEntry$"
+            + mapFieldPathToMethodDescriptionMap.size();
+        FieldPath fieldPath = field.fieldPath;
+        mapFieldPathToMethodNameMap.put(fieldPath, methodName);
+
+        MethodDescription.Token token = new MethodDescription.Token(
+            methodName,
+            Visibility.PRIVATE.getMask(),
+            ForLoadedType.of(void.class),
+            Arrays.asList(ForLoadedType.of(field.key().getFieldReflectionType()), ForLoadedType.of(field.value().isEnum() ? int.class : field.value().getFieldReflectionType())));
+
+        mapFieldPathToMethodDescriptionMap.put(fieldPath, new MethodDescription.Latent(classBuilder[0].toTypeDescription(), token));
       }
 
       static class Implementations implements Implementation {
