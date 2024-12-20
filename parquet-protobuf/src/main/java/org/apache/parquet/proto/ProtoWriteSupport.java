@@ -1872,7 +1872,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                     .filter(ElementMatchers.named("enumDescriptor" + idx))
                     .getOnly()).read(),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "getValues")),
-                ArrayFactory.forType(TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)).withValues(Collections.emptyList()),
+                ArrayFactory.forType(TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor.class)).withValues(Collections.emptyList()),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(List.class, "toArray", Object[].class)),
                 TypeCasting.to(TypeDescription.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)),
                 FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
@@ -2329,6 +2329,27 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               return "get{}Value";
             }
 
+            void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                       MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                       LocalVar iVar) {
+              // load i-th repeated value
+              add(proto3MessageOrBuilder.load(),
+                  iVar.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
+
+              convertRawValueAndWrite();
+            }
+
+            void writeRawValue(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                               MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+              // load value on stack
+              add(proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
+
+              convertRawValueAndWrite();
+            }
+
+
             /**
              *         int enumNumber = getEnumValue.getValue(object);
              *         ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
@@ -2352,8 +2373,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                     Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumClass, "forNumber", int.class))
                 );
                 try (LocalVar enumRef = localVars.register(enumClass)) {
-                  enumRef.store();
-                  enumRef.load();
+                  add(
+                      enumRef.store(),
+                      enumRef.load()
+                  );
                   Label ifEnumRefIsNull = new Label();
                   Label afterEnumValueResolved = new Label();
                   add(Codegen.jumpTo(Opcodes.IFNULL, ifEnumRefIsNull),
@@ -2377,35 +2400,34 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                       localVars.frameSame1(Descriptors.EnumValueDescriptor.class)
                       );
 
-                    try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
-                      add(enumValueDesc.store());
-                      try (LocalVar enumValueDescName = localVars.register(String.class)) {
-                        add(enumValueDesc.load(),
-                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
-                            enumValueDescName.store(),
+                  try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
+                    add(enumValueDesc.store());
+                    try (LocalVar enumValueDescName = localVars.register(String.class)) {
+                      add(enumValueDesc.load(),
+                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
+                          enumValueDescName.store(),
+                          enumValueDescName.load(),
+                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
+                      );
+                      try (LocalVar binary = localVars.register(Binary.class)) {
+                        add(binary.store(),
+                            recordConsumerVar.load(),
+                            binary.load(),
+                            Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
+                            MethodVariableAccess.loadThis(),
+                            FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
+                                .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
+                                .getOnly()).read(),
                             enumValueDescName.load(),
-                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
+                            enumValueDesc.load(),
+                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
+                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
+                            Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
+                            Removal.SINGLE
                         );
-                        try (LocalVar binary = localVars.register(Binary.class)) {
-                          add(binary.store(),
-                              recordConsumerVar.load(),
-                              binary.load(),
-                              Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
-                              MethodVariableAccess.loadThis(),
-                              FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                                  .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                                  .getOnly()).read(),
-                              enumValueDescName.load(),
-                              enumValueDesc.load(),
-                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
-                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
-                              Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
-                              Removal.SINGLE
-                          );
-                        }
                       }
                     }
-
+                  }
                 }
               }
             }
