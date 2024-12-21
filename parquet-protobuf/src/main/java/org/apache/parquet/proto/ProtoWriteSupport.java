@@ -67,9 +67,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.IntFunction;
 import java.util.stream.Stream;
 import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.asm.MemberSubstitution;
 import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.Visibility;
@@ -81,6 +83,7 @@ import net.bytebuddy.dynamic.scaffold.InstrumentedType;
 import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.Implementation;
 import net.bytebuddy.implementation.Implementation.Context;
+import net.bytebuddy.implementation.InvokeDynamic;
 import net.bytebuddy.implementation.MethodCall;
 import net.bytebuddy.implementation.SuperMethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
@@ -92,15 +95,18 @@ import net.bytebuddy.implementation.bytecode.assign.TypeCasting;
 import net.bytebuddy.implementation.bytecode.collection.ArrayAccess;
 import net.bytebuddy.implementation.bytecode.collection.ArrayFactory;
 import net.bytebuddy.implementation.bytecode.constant.IntegerConstant;
+import net.bytebuddy.implementation.bytecode.constant.JavaConstantValue;
 import net.bytebuddy.implementation.bytecode.constant.TextConstant;
 import net.bytebuddy.implementation.bytecode.member.FieldAccess;
 import net.bytebuddy.implementation.bytecode.member.MethodInvocation;
 import net.bytebuddy.implementation.bytecode.member.MethodReturn;
 import net.bytebuddy.implementation.bytecode.member.MethodVariableAccess;
+import net.bytebuddy.jar.asm.Handle;
 import net.bytebuddy.jar.asm.Label;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.matcher.ElementMatchers;
+import net.bytebuddy.utility.JavaConstant;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -1498,6 +1504,18 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         Optional<? extends Class<? extends MessageOrBuilder>> getOwningTypeProto3MessageOrBuilderInterface() {
           return ReflectionUtil.getProto3MessageOrBuilderInterface(owningType);
         }
+
+        FieldDescriptor protoDescriptor() {
+          return fieldWriter.fieldDescriptor;
+        }
+
+        String parquetFieldName() {
+          return fieldWriter.fieldName;
+        }
+
+        int parquetFieldIndex() {
+          return fieldWriter.index;
+        }
       }
 
       class RegularField<T extends ProtoWriteSupport<?>.FieldWriter> extends Field<T> {
@@ -1531,18 +1549,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         boolean isRoot() {
           return fieldPath.isRoot();
-        }
-
-        FieldDescriptor protoDescriptor() {
-          return fieldWriter.fieldDescriptor;
-        }
-
-        String parquetFieldName() {
-          return fieldWriter.fieldName;
-        }
-
-        int parquetFieldIndex() {
-          return fieldWriter.index;
         }
 
         Class<?> getFieldReflectionType() {
@@ -1612,6 +1618,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         RegularField<ProtoWriteSupport<?>.FieldWriter> value() {
           return new RegularField<>(fieldPath.push("value"), owningType, fieldWriter.valueWriter);
+        }
+
+        @Override
+        public String toString() {
+          return "MapField{" +
+              "fieldPath=" + fieldPath +
+              '}';
         }
       }
 
@@ -1774,11 +1787,18 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) && !field.value().isBinaryMessage()) {
+            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent())) {
+              registerWriteMapEntry(field);
+            }
+            return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
+          }
+
+          @Override
+          public void visitMapNonMessageWriter(MapField field) {
+            if (!field.value().isBinaryMessage()) {
               registerWriteMapEntry(field);
               maybeRegisterEnum(field.value());
             }
-            return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
           }
         });
 
@@ -1827,11 +1847,18 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) && !field.value().isBinaryMessage()) {
+            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent())) {
               classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
               return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
             }
             return false;
+          }
+
+          @Override
+          public void visitMapNonMessageWriter(MapField field) {
+             if (!field.value().isBinaryMessage()) {
+               classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
+             }
           }
         });
       }
@@ -2332,31 +2359,117 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 if (field == MessageFieldWriter.this.field) {
                   return true;
                 }
-                Implementation implementation = writeMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar);
-                add(implementation);
+                add(writeMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar));
                 return false;
               }
 
               @Override
-              public void visitNonMessageWriter(
-                  RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-                Implementation implementation = writeNonMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar);
-                add(implementation);
+              public void visitNonMessageWriter(RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+                add(writeNonMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar));
               }
 
               @Override
               public boolean visitMapMessageWriter(MapField field) {
-                add(notOptimizedField(field));
+                if (field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+                  add(writeMapField(field, proto3MessageOrBuilder));
+                } else {
+                  add(notOptimizedField(field));
+                }
                 return false;
               }
 
               @Override
               public void visitMapNonMessageWriter(MapField field) {
-                add(notOptimizedField(field));
+                if (field.value().isBinaryMessage()) {
+                  add(notOptimizedField(field));
+                } else {
+                  add(writeMapField(field, proto3MessageOrBuilder));
+                }
               }
             });
 
             return this;
+          }
+
+          private Implementation writeMapField(MessageWriterVisitor.MapField field, LocalVar proto3MessageOrBuilder) {
+            return new Implementations() {{
+              MethodDescription methodDescription = mapFieldPathToMethodDescriptionMap.get(field.fieldPath);
+              if (methodDescription == null) {
+                throw new IllegalStateException("field: " + field);
+              }
+
+              TypeDescription keyType = TypeDescription.ForLoadedType.of(field.fieldWriter.getFieldReflectionType().getKey()).asBoxed();
+              TypeDescription valueType = TypeDescription.ForLoadedType.of(field.value().isEnum() ? Integer.class : field.fieldWriter.getFieldReflectionType().getValue()).asBoxed();
+
+              Label after = new Label();
+              add(proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),"get{}Count", field.protoDescriptor()),
+                  Codegen.jumpTo(Opcodes.IFLE, after),
+
+                  recordConsumerVar.load(),
+                  new TextConstant(field.parquetFieldName()),
+                  IntegerConstant.forValue(field.parquetFieldIndex()),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.startField));
+
+              if (writeSpecsCompliant()) {
+                add(
+                    recordConsumerVar.load(),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
+                    recordConsumerVar.load(),
+                    new TextConstant("key_value"),
+                    IntegerConstant.forValue(0),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.startField)
+                );
+              }
+
+              add(proto3MessageOrBuilder.load(),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),"get{}" + (field.value().isEnum() ? "Value" : "") + "Map", field.protoDescriptor()),
+                  MethodVariableAccess.loadThis());
+
+              add(new StackManipulation.Simple(new StackManipulation.Simple.Dispatcher() {
+                @Override
+                public StackManipulation.Size apply(MethodVisitor methodVisitor, Context implementationContext) {
+                  methodVisitor.visitInvokeDynamicInsn(
+                      "accept",
+                      "(" + classBuilder[0].toTypeDescription().getDescriptor()+ ")Ljava/util/function/BiConsumer;",
+                      new Handle(
+                          Opcodes.H_INVOKESTATIC,
+                          "java/lang/invoke/LambdaMetafactory",
+                          "metafactory",
+                          "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;", false),
+                      JavaConstantValue.Visitor.INSTANCE.onMethodType(JavaConstant.MethodType.of(void.class, Object.class, Object.class)),
+                      new Handle(
+                          Opcodes.H_INVOKEVIRTUAL,
+                          classBuilder[0].toTypeDescription().getInternalName(),
+                          methodDescription.getInternalName(),
+                          methodDescription.getDescriptor(), false),
+                      JavaConstantValue.Visitor.INSTANCE.onMethodType(JavaConstant.MethodType.of(TypeDescription.ForLoadedType.of(void.class), keyType, valueType))
+                      );
+                  return StackManipulation.Size.ZERO;
+                }
+              }));
+              add(Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "forEach", BiConsumer.class)));
+
+              if (writeSpecsCompliant()) {
+                add(
+                    recordConsumerVar.load(),
+                    new TextConstant("key_value"),
+                    IntegerConstant.forValue(0),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.endField),
+                    recordConsumerVar.load(),
+                    Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+                );
+              }
+
+              add(recordConsumerVar.load(),
+                  new TextConstant(field.parquetFieldName()),
+                  IntegerConstant.forValue(field.parquetFieldIndex()),
+                  Codegen.invokeMethod(Reflection.RecordConsumer.endField));
+
+              add(Codegen.visitLabel(after),
+                  localVars.frameEmptyStack()
+              );
+            }};
           }
 
           protected Implementation writeNonMessageRegularField(
