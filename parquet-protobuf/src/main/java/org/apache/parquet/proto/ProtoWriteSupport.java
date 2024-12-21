@@ -71,7 +71,6 @@ import java.util.function.BiConsumer;
 import java.util.function.IntFunction;
 import java.util.stream.Stream;
 import net.bytebuddy.ByteBuddy;
-import net.bytebuddy.asm.MemberSubstitution;
 import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.Visibility;
@@ -83,8 +82,6 @@ import net.bytebuddy.dynamic.scaffold.InstrumentedType;
 import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.Implementation;
 import net.bytebuddy.implementation.Implementation.Context;
-import net.bytebuddy.implementation.InvokeDynamic;
-import net.bytebuddy.implementation.MethodCall;
 import net.bytebuddy.implementation.SuperMethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
 import net.bytebuddy.implementation.bytecode.Removal;
@@ -1142,6 +1139,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     static class ByteBuddyProto3FastMessageWriterMethods {
       final Method getRecordConsumer = ReflectionUtil.getDeclaredMethod(
           ByteBuddyProto3FastMessageWriters.ByteBuddyProto3FastMessageWriter.class, "getRecordConsumer");
+      final Method enumNameNumberPairs = ReflectionUtil.getDeclaredMethod(ByteBuddyProto3FastMessageWriters.ByteBuddyProto3FastMessageWriter.class, "enumNameNumberPairs", String.class);
+      final Method writeNotOptimizedField = ReflectionUtil.getDeclaredMethod(ByteBuddyProto3FastMessageWriters.ByteBuddyProto3FastMessageWriter.class, "writeNotOptimizedField", int.class, Object.class);
 
       private ByteBuddyProto3FastMessageWriterMethods() {}
     }
@@ -1365,31 +1364,53 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     abstract static class ByteBuddyProto3FastMessageWriter implements FastMessageWriter {
       final ProtoWriteSupport<?> protoWriteSupport;
-      final ProtoWriteSupport<?>.MessageWriter[] messageWriters;
+      final ProtoWriteSupport<?>.FieldWriter[] notOptimizedFieldWriters;
 
       ByteBuddyProto3FastMessageWriter(ProtoWriteSupport<?> protoWriteSupport, ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
         this.protoWriteSupport = protoWriteSupport;
-        this.messageWriters = createMessageWriterArray(rootMessageWriter);
+        this.notOptimizedFieldWriters = createNotOptimizedFieldWriters(rootMessageWriter);
       }
 
-      private static ProtoWriteSupport<?>.MessageWriter[] createMessageWriterArray(ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
-        final List<ProtoWriteSupport<?>.MessageWriter> writers = new ArrayList<>();
+      void writeNotOptimizedField(int fieldWriter, Object value) {
+        notOptimizedFieldWriters[fieldWriter].writeRawValue(value);
+      }
+
+      private static ProtoWriteSupport<?>.FieldWriter[] createNotOptimizedFieldWriters(ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
+        final List<ProtoWriteSupport<?>.FieldWriter> writers = new ArrayList<>();
         MessageWriterVisitor.traverse(new MessageWriterVisitor.RegularField<>(new FieldPath(), null, rootMessageWriter), new MessageWriterVisitor() {
           @Override
           public boolean visitMessageWriter(RegularField<?> field) {
-            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
-              writers.add((ProtoWriteSupport<?>.MessageWriter) field.rawValueWriter());
-              return true;
+            if (!field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              writers.add(field.fieldWriter);
+              return false; // SINGLE_FILE
             }
-            return false;
+            return true;
+          }
+
+          @Override
+          public void visitNonMessageWriter(RegularField<?> field) {
+            if (field.isBinaryMessage()) {
+              writers.add(field.fieldWriter);
+            }
+          }
+
+          @Override
+          public void visitMapNonMessageWriter(MapField field) {
+            if (field.value().isBinaryMessage()) {
+              writers.add(field.value().fieldWriter);
+            }
           }
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            return false;
+            if (!field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              writers.add(field.value().fieldWriter);
+              return false; // SINGLE_FILE
+            }
+            return true;
           }
         });
-        return writers.toArray(new ProtoWriteSupport<?>.MessageWriter[0]);
+        return writers.toArray(new ProtoWriteSupport<?>.FieldWriter[0]);
       }
 
       /**
@@ -1434,7 +1455,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       } catch (Exception e) {
       }
 
-      furtherFieldWriters.addAll(impl.notOptimizedMessageWriters);
+      furtherFieldWriters.addAll(impl.notOptimizedFieldWriters);
 
       Class<? extends ByteBuddyProto3FastMessageWriter> fastMessageWriterClass = unloaded.load(
               null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
@@ -1727,7 +1748,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final ProtoWriteSupport<?> protoWriteSupport;
       final ProtoWriteSupport<?>.MessageWriter rootMessageWriter;
 
-      final List<ProtoWriteSupport<?>.MessageWriter> notOptimizedMessageWriters = new ArrayList<>();
+      final List<ProtoWriteSupport<?>.FieldWriter> notOptimizedFieldWriters = new ArrayList<>();
 
       final Map<FieldPath, String> fieldPathToMethodNameMap = new HashMap<>();
       final Map<FieldPath, MethodDescription> fieldPathToMethodDescriptionMap = new HashMap<>();
@@ -1765,7 +1786,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               registerWriteAllFieldsForMessageMethod(field);
               return true;
             } else {
-              notOptimizedMessageWriters.add((ProtoWriteSupport<?>.MessageWriter) field.rawValueWriter());
+              notOptimizedFieldWriters.add(field.rawValueWriter());
               return false;
             }
           }
@@ -1773,6 +1794,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           @Override
           public void visitNonMessageWriter(RegularField<?> field) {
             maybeRegisterEnum(field);
+            if (field.isBinaryMessage()) {
+              notOptimizedFieldWriters.add(field.rawValueWriter());
+            }
           }
 
           private void maybeRegisterEnum(RegularField<?> field) {
@@ -1787,17 +1811,21 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent())) {
-              registerWriteMapEntry(field);
+            registerWriteMapEntry(field);
+            if (field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              return true;
+            } else {
+              notOptimizedFieldWriters.add(field.value().fieldWriter);
+              return false;
             }
-            return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
           }
 
           @Override
           public void visitMapNonMessageWriter(MapField field) {
-            if (!field.value().isBinaryMessage()) {
-              registerWriteMapEntry(field);
-              maybeRegisterEnum(field.value());
+            registerWriteMapEntry(field);
+            maybeRegisterEnum(field.value());
+            if (field.value().isBinaryMessage()) {
+              notOptimizedFieldWriters.add(field.value().fieldWriter);
             }
           }
         });
@@ -1847,18 +1875,13 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapMessageWriter(MapField field) {
-            if ((field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent())) {
-              classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
-              return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
-            }
-            return false;
+            classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
+            return field.value().isMessage() && field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent();
           }
 
           @Override
           public void visitMapNonMessageWriter(MapField field) {
-             if (!field.value().isBinaryMessage()) {
-               classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
-             }
+             classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
           }
         });
       }
@@ -1885,7 +1908,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             add(MethodVariableAccess.loadThis(),
                 MethodVariableAccess.loadThis(),
                 new TextConstant(enumTypeFullName),
-                Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(ByteBuddyProto3FastMessageWriter.class, "enumNameNumberPairs", String.class)),
+                Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.enumNameNumberPairs),
                 FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
                     .filter(ElementMatchers.named("enumNameNumberPairs" + idx))
                     .getOnly()).write()
@@ -1945,11 +1968,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                       Codegen.invokeMethod(Reflection.RecordConsumer.startGroup)
                   );
                   steps.add(writeFromVar(field.key(), key, recordConsumerVar));
-//                   if (field.value().isMessage()) {
-//                     writeMessageFieldsInternal(value, recordConsumerVar, (MessageWriterVisitor.RegularField) field.value());
-//                   } else {
                   steps.add(writeFromVar(field.value(), value, recordConsumerVar));
-//                   }
                   steps.add(
                       recordConsumerVar.load(),
                       Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
@@ -1974,6 +1993,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return new ProtoWrapperFieldWriter(field, recordConsumer).writeFromVar(val);
           } else if (field.isPrimitive()) {
             return new PrimitiveFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isBinaryMessage()) {
+            return new NotOptimizedObjectWriter(field, recordConsumer).writeFromVar(val);
           }
           throw new IllegalStateException("field: " + field);
         }
@@ -2168,20 +2189,17 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return this;
           }
 
-          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
-            add(recordConsumerVar.load(),
-                proto3MessageOrBuilder.load(),
+          void loadRepeatedValueOnStack(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            add(proto3MessageOrBuilder.load(),
                 iVar.load(),
                 Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
           }
 
-          void afterConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
-          }
-
           void writeRepeatedRawValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
-            beforeConvertRepeatedValue(proto3MessageOrBuilder, iVar);
+            beforeLoadValueOnStack();
+            loadRepeatedValueOnStack(proto3MessageOrBuilder, iVar);
             convertRawValueAndWrite();
-            afterConvertRepeatedValue(proto3MessageOrBuilder, iVar);
+            afterConvertRawValue();
           }
 
           Implementation writeFromVar(LocalVar var) {
@@ -2190,9 +2208,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 IntegerConstant.forValue(field.parquetFieldIndex()),
                 Codegen.invokeMethod(Reflection.RecordConsumer.startField)
             );
-            add(recordConsumerVar.load(),
-                var.load());
+            beforeLoadValueOnStack();
+            add(var.load());
             convertRawValueAndWrite();
+            afterConvertRawValue();
             add(recordConsumerVar.load(),
                 new TextConstant(field.parquetFieldName()),
                 IntegerConstant.forValue(field.parquetFieldIndex()),
@@ -2201,19 +2220,23 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             return this;
           }
 
-          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
-            add(recordConsumerVar.load(),
-                proto3MessageOrBuilder.load(),
+          void loadSingleValueOnStack(LocalVar proto3MessageOrBuilder) {
+            add(proto3MessageOrBuilder.load(),
                 Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
           }
 
-          void afterConvertSingleValue(LocalVar proto3MessageOrBuilder) {
+          void beforeLoadValueOnStack() {
+            add(recordConsumerVar.load());
+          }
+
+          void afterConvertRawValue() {
           }
 
           void writeRawValue(LocalVar proto3MessageOrBuilder) {
-            beforeConvertSingleValue(proto3MessageOrBuilder);
+            beforeLoadValueOnStack();
+            loadSingleValueOnStack(proto3MessageOrBuilder);
             convertRawValueAndWrite();
-            afterConvertSingleValue(proto3MessageOrBuilder);
+            afterConvertRawValue();
           }
 
           abstract void convertRawValueAndWrite();
@@ -2246,10 +2269,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             LocalVar proto3MessageOrBuilder,
             LocalVar recordConsumerVar,
             MessageWriterVisitor.RegularField<?> field) {
-          if (!field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
-              .isPresent()) {
-            return null;
-          }
           return new MessageFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
         }
 
@@ -2278,19 +2297,20 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           void convertRawValueAndWrite() {
-            MethodDescription methodDescription = fieldPathToMethodDescriptionMap.get(field.fieldPath);
-            if (methodDescription == null) {
-              throw new IllegalStateException("field: " + field);
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              MethodDescription methodDescription = fieldPathToMethodDescriptionMap.get(field.fieldPath);
+              if (methodDescription == null) {
+                throw new IllegalStateException("field: " + field);
+              }
+              add(MethodInvocation.invoke(methodDescription));
+            } else {
+              add(Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.writeNotOptimizedField));
             }
-            add(MethodInvocation.invoke(
-                methodDescription));
           }
 
           @Override
-          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
-            startGroup();
-            add(MethodVariableAccess.loadThis(),
-                proto3MessageOrBuilder.load(),
+          void loadRepeatedValueOnStack(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+            add(proto3MessageOrBuilder.load(),
                 iVar.load(),
                 Codegen.invokeProtoMethod(
                     proto3MessageOrBuilder.clazz(),
@@ -2299,22 +2319,22 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                     int.class));
           }
 
-          @Override
-          void afterConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
-            endGroup();
-          }
-
           Implementation writeFromVar(LocalVar var) {
             add(recordConsumerVar.load(),
                 new TextConstant(field.parquetFieldName()),
                 IntegerConstant.forValue(field.parquetFieldIndex()),
                 Codegen.invokeMethod(Reflection.RecordConsumer.startField)
             );
-            startGroup();
-//             add(var.load());
-            writeMessageFieldsInternal(var);
-//             convertRawValueAndWrite();
-            endGroup();
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              startGroup();
+              writeMessageFieldsInternal(var);
+              endGroup();
+            } else {
+              add(MethodVariableAccess.loadThis(),
+                  IntegerConstant.forValue(notOptimizedFieldWriters.indexOf(field.rawValueWriter())),
+                  var.load());
+              convertRawValueAndWrite();
+            }
             add(recordConsumerVar.load(),
                 new TextConstant(field.parquetFieldName()),
                 IntegerConstant.forValue(field.parquetFieldIndex()),
@@ -2324,11 +2344,19 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
 
           @Override
-          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
-            startGroup();
+          void beforeLoadValueOnStack() {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              startGroup();
+              add(MethodVariableAccess.loadThis());
+            } else {
+              add(MethodVariableAccess.loadThis(),
+                  IntegerConstant.forValue(notOptimizedFieldWriters.indexOf(field.rawValueWriter())));
+            }
+          }
 
-            add(MethodVariableAccess.loadThis(),
-                proto3MessageOrBuilder.load(),
+          @Override
+          void loadSingleValueOnStack(LocalVar proto3MessageOrBuilder) {
+            add(proto3MessageOrBuilder.load(),
                 Codegen.invokeProtoMethod(
                     proto3MessageOrBuilder.clazz(),
                     getterMethodTemplate(),
@@ -2336,8 +2364,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
 
           @Override
-          void afterConvertSingleValue(LocalVar proto3MessageOrBuilder) {
-            endGroup();
+          void afterConvertRawValue() {
+            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+              endGroup();
+            }
           }
 
           void startGroup() {
@@ -2359,32 +2389,24 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 if (field == MessageFieldWriter.this.field) {
                   return true;
                 }
-                add(writeMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar));
+                add(writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field));
                 return false;
               }
 
               @Override
               public void visitNonMessageWriter(RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-                add(writeNonMessageRegularField(field, proto3MessageOrBuilder, recordConsumerVar));
+                add(writeNonMessageRegularField(field, proto3MessageOrBuilder));
               }
 
               @Override
               public boolean visitMapMessageWriter(MapField field) {
-                if (field.value().getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
-                  add(writeMapField(field, proto3MessageOrBuilder));
-                } else {
-                  add(notOptimizedField(field));
-                }
+                add(writeMapField(field, proto3MessageOrBuilder));
                 return false;
               }
 
               @Override
               public void visitMapNonMessageWriter(MapField field) {
-                if (field.value().isBinaryMessage()) {
-                  add(notOptimizedField(field));
-                } else {
-                  add(writeMapField(field, proto3MessageOrBuilder));
-                }
+                add(writeMapField(field, proto3MessageOrBuilder));
               }
             });
 
@@ -2474,48 +2496,45 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           protected Implementation writeNonMessageRegularField(
               MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-              LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
-            Implementation implementation = null;
+              LocalVar proto3MessageOrBuilder) {
             if (field.isPrimitive()) {
-              implementation = writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
+              return writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
             } else if (field.isBinary()) {
-              implementation = writeBinaryField(proto3MessageOrBuilder, recordConsumerVar, field);
+              return writeBinaryField(proto3MessageOrBuilder, recordConsumerVar, field);
             } else if (field.isString()) {
-              implementation = writeStringField(proto3MessageOrBuilder, recordConsumerVar, field);
+              return writeStringField(proto3MessageOrBuilder, recordConsumerVar, field);
             } else if (field.isProtoWrapper()) {
-              implementation = writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
+              return writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
             } else if (field.isEnum()) {
-              implementation = writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
+              return writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
+            } else if (field.isBinaryMessage()) {
+              return writeBinaryMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
             }
-            if (implementation == null) {
-              implementation = notOptimizedField(field);
-            }
-            return implementation;
+            throw new IllegalStateException("field: " + field);
           }
 
-          protected Implementation writeMessageRegularField(MessageWriterVisitor.RegularField<?> field,
-                                                            LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar) {
-            Implementation implementation =
-                writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
-            if (implementation == null) {
-              implementation = notOptimizedField(field);
-            }
-            return implementation;
+          private Implementation writeBinaryMessageField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
+                                                         MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
+            return new NotOptimizedObjectWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
+          }
+        }
+
+        class NotOptimizedObjectWriter extends RegularFieldWriterTemplate {
+
+          NotOptimizedObjectWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                   LocalVar recordConsumerVar) {
+            super(field, recordConsumerVar);
           }
 
-          protected Implementation notOptimizedField(MessageWriterVisitor.Field<?> field) {
-            Implementation implementation;
-            JavaReflectionProto3FastMessageWriters.FieldOfObjectWriter fieldOfObjectWriter =
-                JavaReflectionProto3FastMessageWriters.createFieldOfObjectWriter(
-                    field.getOwningTypeProto3MessageOrBuilderInterface()
-                        .get(),
-                    field.fieldWriter);
+          @Override
+          void beforeLoadValueOnStack() {
+            add(MethodVariableAccess.loadThis(),
+                IntegerConstant.forValue(notOptimizedFieldWriters.indexOf(field.rawValueWriter())));
+          }
 
-            implementation = MethodCall.invoke(Reflection.FieldOfObjectWriter.writeFieldOfObject)
-                .on(fieldOfObjectWriter)
-                .withArgument(0)
-                .andThen(NOOP);
-            return implementation;
+          @Override
+          void convertRawValueAndWrite() {
+            add(Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.writeNotOptimizedField));
           }
         }
 
@@ -2671,32 +2690,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           }
 
           @Override
-          void beforeConvertRepeatedValue(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
+          void loadRepeatedValueOnStack(LocalVar proto3MessageOrBuilder, LocalVar iVar) {
             add(proto3MessageOrBuilder.load(),
                 iVar.load(),
                 Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor(), int.class));
           }
 
-          Implementation writeFromVar(LocalVar var) {
-            add(recordConsumerVar.load(),
-                new TextConstant(field.parquetFieldName()),
-                IntegerConstant.forValue(field.parquetFieldIndex()),
-                Codegen.invokeMethod(Reflection.RecordConsumer.startField)
-            );
-            add(var.load());
-            convertRawValueAndWrite();
-            add(recordConsumerVar.load(),
-                new TextConstant(field.parquetFieldName()),
-                IntegerConstant.forValue(field.parquetFieldIndex()),
-                Codegen.invokeMethod(Reflection.RecordConsumer.endField)
-            );
-            return this;
-          }
-
           @Override
-          void beforeConvertSingleValue(LocalVar proto3MessageOrBuilder) {
-            add(proto3MessageOrBuilder.load(),
-                Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(), getterMethodTemplate(), field.protoDescriptor()));
+          void beforeLoadValueOnStack() {
           }
 
           /**
