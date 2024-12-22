@@ -1528,7 +1528,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                                             Map<ProtoWriteSupport<?>.FieldWriter, Integer> optimizedFieldWriters) {
         Map<MessageWriterVisitor.MethodKey, Integer> fieldMethodsIndex = new HashMap<>();
 
-        MessageWriterVisitor.traverse(new MessageWriterVisitor.RegularField<>(new FieldPath(), null, rootMessageWriter, 0), new MessageWriterVisitor() {
+        MessageWriterVisitor.traverse(new MessageWriterVisitor.RegularField<>(null, new FieldPath(), rootMessageWriter), new MessageWriterVisitor() {
           @Override
           public boolean visitMessageWriter(RegularField<?> field) {
             Integer idx = fieldMethodsIndex.computeIfAbsent(field.asMessageWriterMethodKey(), k -> fieldMethodsIndex.size());
@@ -1669,27 +1669,30 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       abstract class Field<T extends ProtoWriteSupport<?>.FieldWriter> {
+        final Field<?> parent;
         final FieldPath fieldPath;
-        final Class<? extends Message> owningType;
         final T fieldWriter;
-        final int level;
 
-        Field(FieldPath fieldPath, Class<? extends Message> owningType, T fieldWriter, int level) {
+        Field(Field<?> parent, FieldPath fieldPath, T fieldWriter) {
+          this.parent = parent;
           this.fieldPath = fieldPath;
-          this.owningType = owningType;
           this.fieldWriter = fieldWriter;
-          this.level = level;
         }
 
         MethodKey asMessageWriterMethodKey() {
-          return new MethodKey(getFieldReflectionType(), level);
+          Field<?> p = parent;
+          int level = 0;
+          java.lang.reflect.Type thisReflectionType = getFieldReflectionType();
+          while (p != null) {
+            if (Objects.equals(p.getFieldReflectionType(), thisReflectionType)) {
+              level += 1;
+            }
+            p = p.parent;
+          }
+          return new MethodKey(thisReflectionType, level);
         }
 
         abstract java.lang.reflect.Type getFieldReflectionType();
-
-        Optional<? extends Class<? extends MessageOrBuilder>> getOwningTypeProto3MessageOrBuilderInterface() {
-          return ReflectionUtil.getProto3MessageOrBuilderInterface(owningType);
-        }
 
         FieldDescriptor protoDescriptor() {
           return fieldWriter.fieldDescriptor;
@@ -1727,8 +1730,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       class RegularField<T extends ProtoWriteSupport<?>.FieldWriter> extends Field<T> {
-        RegularField(FieldPath fieldPath, Class<? extends Message> owningType, T fieldWriter, int level) {
-          super(fieldPath, owningType, fieldWriter, level);
+        RegularField(Field<?> parent, FieldPath fieldPath, T fieldWriter) {
+          super(parent, fieldPath, fieldWriter);
         }
 
         @Override
@@ -1740,9 +1743,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         public String toString() {
           return "RegularField{" +
               "fieldPath=" + fieldPath +
-              ", owningType=" + owningType +
-              ", fieldWriter=" + fieldWriter +
-              ", level=" + level +
               '}';
         }
 
@@ -1758,7 +1758,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             throw new IllegalStateException();
           }
           return new RegularField<>(
-              fieldPath, owningType, (ProtoWriteSupport<?>.MessageWriter) rawValueWriter(), level);
+              parent, fieldPath, (ProtoWriteSupport<?>.MessageWriter) rawValueWriter());
         }
 
         boolean isRoot() {
@@ -1825,11 +1825,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
       class MapField extends Field<ProtoWriteSupport<?>.MapWriter> {
         MapField(
+            Field<?> parent,
             FieldPath fieldPath,
-            Class<? extends Message> owningType,
-            ProtoWriteSupport<?>.MapWriter mapWriter,
-            int level) {
-          super(fieldPath, owningType, mapWriter, level);
+            ProtoWriteSupport<?>.MapWriter mapWriter) {
+          super(parent, fieldPath, mapWriter);
         }
 
         @Override
@@ -1838,11 +1837,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         RegularField<ProtoWriteSupport<?>.FieldWriter> key() {
-          return new RegularField<>(fieldPath.push("key"), owningType, fieldWriter.keyWriter, level);
+          return new RegularField<>(this, fieldPath.push("key"), fieldWriter.keyWriter);
         }
 
         RegularField<ProtoWriteSupport<?>.FieldWriter> value() {
-          return new RegularField<>(fieldPath.push("value"), owningType, fieldWriter.valueWriter, level);
+          return new RegularField<>(this, fieldPath.push("value"), fieldWriter.valueWriter);
         }
 
         @Override
@@ -1870,14 +1869,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         class FieldPathAndMessageWriter {
+          final Field<?> parent;
           final FieldPath fieldPath;
           final ProtoWriteSupport<?>.MessageWriter messageWriter;
-          final int level;
 
-          FieldPathAndMessageWriter(FieldPath fieldPath, ProtoWriteSupport<?>.MessageWriter messageWriter, int level) {
+          FieldPathAndMessageWriter(Field<?> parent, FieldPath fieldPath, ProtoWriteSupport<?>.MessageWriter messageWriter) {
+            this.parent = parent;
             this.fieldPath = fieldPath;
             this.messageWriter = messageWriter;
-            this.level = level;
           }
         }
 
@@ -1887,16 +1886,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             visitField(start, queue);
             while (!queue.isEmpty()) {
               FieldPathAndMessageWriter next = queue.poll();
-              Class<? extends Message> owningType = next.messageWriter.getFieldReflectionType();
 
               for (ProtoWriteSupport<?>.FieldWriter fieldWriter : next.messageWriter.fieldWriters) {
-                FieldPath field = next.fieldPath.push(fieldWriter.fieldName);
+                FieldPath fieldPath = next.fieldPath.push(fieldWriter.fieldName);
                 if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-                  MapField mapField = new MapField(
-                      field, owningType, (ProtoWriteSupport<?>.MapWriter) fieldWriter, next.level + 1);
+                  MapField mapField = new MapField(next.parent, fieldPath, (ProtoWriteSupport<?>.MapWriter) fieldWriter);
                   visitMap(mapField, queue);
                 } else {
-                  RegularField<?> regularField = new RegularField<>(field, owningType, fieldWriter, next.level + 1);
+                  RegularField<?> regularField = new RegularField<>(next.parent, fieldPath, fieldWriter);
                   visitField(regularField, queue);
                 }
               }
@@ -1907,8 +1904,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             if (regularField.isMessage()) {
               if (visitor.visitMessageWriter(regularField)) {
                 queue.add(new FieldPathAndMessageWriter(
+                    regularField,
                     regularField.fieldPath,
-                    (ProtoWriteSupport<?>.MessageWriter) regularField.rawValueWriter(), regularField.level));
+                    (ProtoWriteSupport<?>.MessageWriter) regularField.rawValueWriter()));
               }
             } else {
               visitor.visitNonMessageWriter(regularField);
@@ -1970,7 +1968,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         };
 
         final MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.MessageWriter> start =
-            new MessageWriterVisitor.RegularField<>(new FieldPath(), null, rootMessageWriter, 0);
+            new MessageWriterVisitor.RegularField<>(null, new FieldPath(), rootMessageWriter);
 
         // first scan - collect methods and fields for enums
         MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
