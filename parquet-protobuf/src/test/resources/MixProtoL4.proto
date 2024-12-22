@@ -23,16 +23,16 @@ package MixProto;
 
 option java_package = "org.apache.parquet.proto.test";
 
-message ProtoL4 {
+message Proto2L4 {
 //  required ProtoL4Terminal proto2 = 1;
-  optional ProtoL4Terminal optionalProto2 = 2;
-  repeated ProtoL4Terminal repeatedProto2 = 3;
-  map<string, ProtoL4Terminal> mapIntProto2 = 4;
+  optional Proto2L4Terminal optionalProto2 = 2;
+  repeated Proto2L4Terminal repeatedProto2 = 3;
+  map<string, Proto2L4Terminal> map1Proto2 = 4;
 
 //  optional ProtoL4 recursive = 5;
 }
 
-message ProtoL4Terminal {
+message Proto2L4Terminal {
   optional int32 singleField = 1;
 //  optional ProtoL4Terminal recursive = 5;
 }

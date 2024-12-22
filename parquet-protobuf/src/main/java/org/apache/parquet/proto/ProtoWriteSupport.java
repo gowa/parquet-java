@@ -1590,10 +1590,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
 
-      try {
-        unloaded.saveIn(new java.io.File("generated_debug"));
-      } catch (Exception e) {
-      }
+//       try {
+//         unloaded.saveIn(new java.io.File("generated_debug"));
+//       } catch (Exception e) {
+//       }
 
         writerClass = unloaded.load(
                 null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
@@ -1682,7 +1682,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         MethodKey asMessageWriterMethodKey() {
-          return new MethodKey(fieldPath.pop(), getFieldReflectionType(), level);
+          return new MethodKey(getFieldReflectionType(), level);
         }
 
         abstract java.lang.reflect.Type getFieldReflectionType();
@@ -1705,12 +1705,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       final class MethodKey {
-        final FieldPath parent;
         final java.lang.reflect.Type reflectionType;
         final int level;
 
-        public MethodKey(FieldPath parent, java.lang.reflect.Type reflectionType, int level) {
-          this.parent = parent;
+        public MethodKey(java.lang.reflect.Type reflectionType, int level) {
           this.reflectionType = reflectionType;
           this.level = level;
         }
@@ -1719,12 +1717,12 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         public boolean equals(Object o) {
           if (o == null || getClass() != o.getClass()) return false;
           MethodKey that = (MethodKey) o;
-          return level == that.level && Objects.equals(parent, that.parent) && Objects.equals(reflectionType, that.reflectionType);
+          return level == that.level && Objects.equals(reflectionType, that.reflectionType);
         }
 
         @Override
         public int hashCode() {
-          return Objects.hash(parent, reflectionType, level);
+          return Objects.hash(reflectionType, level);
         }
       }
 
@@ -1840,11 +1838,11 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         }
 
         RegularField<ProtoWriteSupport<?>.FieldWriter> key() {
-          return new RegularField<>(fieldPath.pop().push(fieldPath.getField() + ".key"), owningType, fieldWriter.keyWriter, level);
+          return new RegularField<>(fieldPath.push("key"), owningType, fieldWriter.keyWriter, level);
         }
 
         RegularField<ProtoWriteSupport<?>.FieldWriter> value() {
-          return new RegularField<>(fieldPath.pop().push(fieldPath.getField() + ".value"), owningType, fieldWriter.valueWriter, level);
+          return new RegularField<>(fieldPath.push("value"), owningType, fieldWriter.valueWriter, level);
         }
 
         @Override
@@ -1950,8 +1948,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final Map<MessageWriterVisitor.MethodKey, String> fieldPathToMethodNameMap = new LinkedHashMap<>();
       final Map<MessageWriterVisitor.MethodKey, MethodDescription> fieldPathToMethodDescriptionMap = new LinkedHashMap<>();
 
-      final Map<FieldPath, String> mapFieldPathToMethodNameMap = new LinkedHashMap<>();
-      final Map<FieldPath, MethodDescription> mapFieldPathToMethodDescriptionMap = new LinkedHashMap<>();
+      final Map<MessageWriterVisitor.MethodKey, String> mapFieldPathToMethodNameMap = new LinkedHashMap<>();
+      final Map<MessageWriterVisitor.MethodKey, MethodDescription> mapFieldPathToMethodDescriptionMap = new LinkedHashMap<>();
 
       final Map<String, Integer> enumTypeFullNameToFieldIdx = new LinkedHashMap<>();
       final Map<String, Class<?>> enumTypeFullNameToClassMap = new LinkedHashMap<>();
@@ -2045,6 +2043,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             .intercept(SuperMethodCall.INSTANCE.andThen(new FastMessageWriterConstructor()));
 
         Set<MessageWriterVisitor.MethodKey> definedMethods = new HashSet<>();
+        Set<MessageWriterVisitor.MethodKey> definedMapMethods = new HashSet<>();
 
         // second scan - register methods
         MessageWriterVisitor.traverse(start, new MessageWriterVisitor() {
@@ -2059,7 +2058,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           public boolean visitMapWriter(MapField field) {
-            classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.fieldPath)).intercept(new WriteAllFieldsForMapEntryImplementation(field));
+            if (definedMapMethods.add(field.asMessageWriterMethodKey())) {
+              classBuilder[0] = classBuilder[0].define(mapFieldPathToMethodDescriptionMap.get(field.asMessageWriterMethodKey())).intercept(new WriteAllFieldsForMapEntryImplementation(field));
+            }
             return true;
           }
 
@@ -2174,7 +2175,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           } else if (field.isPrimitive()) {
             return new PrimitiveFieldWriter(field, recordConsumer).writeFromVar(val);
           } else if (field.isBinaryMessage()) {
-            return new NotOptimizedObjectWriter(field, recordConsumer).writeFromVar(val);
+            return new NotOptimizedObjectFieldWriter(field, recordConsumer).writeFromVar(val);
           }
           throw new IllegalStateException("field: " + field);
         }
@@ -2584,7 +2585,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           private Implementation writeMapField(MessageWriterVisitor.MapField field, LocalVar proto3MessageOrBuilder) {
             return new Implementations() {{
-              MethodDescription methodDescription = mapFieldPathToMethodDescriptionMap.get(field.fieldPath);
+              MethodDescription methodDescription = mapFieldPathToMethodDescriptionMap.get(field.asMessageWriterMethodKey());
               if (methodDescription == null) {
                 throw new IllegalStateException("field: " + field);
               }
@@ -2684,14 +2685,14 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           private Implementation writeBinaryMessageField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
                                                          MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-            return new NotOptimizedObjectWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
+            return new NotOptimizedObjectFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
           }
         }
 
-        class NotOptimizedObjectWriter extends RegularFieldWriterTemplate {
+        class NotOptimizedObjectFieldWriter extends RegularFieldWriterTemplate {
 
-          NotOptimizedObjectWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-                                   LocalVar recordConsumerVar) {
+          NotOptimizedObjectFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+                                        LocalVar recordConsumerVar) {
             super(field, recordConsumerVar);
           }
 
@@ -3065,7 +3066,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       private void registerWriteAllFieldsForMessageMethod(MessageWriterVisitor.RegularField<?> field) {
-
         MessageWriterVisitor.MethodKey key = field.asMessageWriterMethodKey();
         if (!fieldPathToMethodNameMap.containsKey(key)) {
           String methodName = "writeAllFields$" + fieldPathToMethodDescriptionMap.size();
@@ -3083,18 +3083,19 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       }
 
       private void registerWriteMapEntry(MessageWriterVisitor.MapField field) {
-        String methodName = "writeMapEntry$"
-            + mapFieldPathToMethodDescriptionMap.size();
-        FieldPath fieldPath = field.fieldPath;
-        mapFieldPathToMethodNameMap.put(fieldPath, methodName);
+        MessageWriterVisitor.MethodKey key = field.asMessageWriterMethodKey();
+        if (!mapFieldPathToMethodNameMap.containsKey(key)) {
+          String methodName = "writeMapEntry$" + mapFieldPathToMethodDescriptionMap.size();
+          mapFieldPathToMethodNameMap.put(key, methodName);
 
-        MethodDescription.Token token = new MethodDescription.Token(
-            methodName,
-            Visibility.PUBLIC.getMask(),
-            ForLoadedType.of(void.class),
-            Arrays.asList(ForLoadedType.of((Class<?>) field.key().getFieldReflectionType()), ForLoadedType.of(field.value().isEnum() ? int.class : (Class<?>) field.value().getFieldReflectionType())));
+          MethodDescription.Token token = new MethodDescription.Token(
+              methodName,
+              Visibility.PUBLIC.getMask(),
+              ForLoadedType.of(void.class),
+              Arrays.asList(ForLoadedType.of((Class<?>) field.key().getFieldReflectionType()), ForLoadedType.of(field.value().isEnum() ? int.class : (Class<?>) field.value().getFieldReflectionType())));
 
-        mapFieldPathToMethodDescriptionMap.put(fieldPath, new MethodDescription.Latent(classBuilder[0].toTypeDescription(), token));
+          mapFieldPathToMethodDescriptionMap.put(key, new MethodDescription.Latent(classBuilder[0].toTypeDescription(), token));
+        }
       }
 
       static class Implementations implements Implementation {

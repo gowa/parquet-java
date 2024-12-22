@@ -393,16 +393,16 @@ public class ProtoInputOutputFormatTest {
 
   @Test
   public void testMixProtoL1() throws Exception {
-    MixProtoL1.ProtoL1 msgEmpty = MixProtoL1.ProtoL1.newBuilder().build();
-    MixProtoL1.ProtoL1 msgNonEmpty =
-        fillProtoL1(MixProtoL1.ProtoL1.newBuilder()).build();
+    MixProtoL1.Proto3L1 msgEmpty = MixProtoL1.Proto3L1.newBuilder().build();
+    MixProtoL1.Proto3L1 msgNonEmpty =
+        fillProtoL1(MixProtoL1.Proto3L1.newBuilder()).build();
 
     Configuration conf = new Configuration();
     ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
 
     Path outputPath = new WriteUsingMR(conf).write(msgEmpty, msgNonEmpty);
     ReadUsingMR readUsingMR = new ReadUsingMR(conf);
-    String customClass = MixProtoL1.ProtoL1.class.getName();
+    String customClass = MixProtoL1.Proto3L1.class.getName();
     ProtoReadSupport.setProtobufClass(readUsingMR.getConfiguration(), customClass);
     List<Message> result = readUsingMR.read(outputPath);
 
@@ -413,16 +413,16 @@ public class ProtoInputOutputFormatTest {
 
   @Test
   public void testMixProtoL2() throws Exception {
-    MixProtoL2.ProtoL2 msgEmpty = MixProtoL2.ProtoL2.newBuilder().build();
-    MixProtoL2.ProtoL2 msgNonEmpty =
-        fillProtoL2(MixProtoL2.ProtoL2.newBuilder()).build();
+    MixProtoL2.Proto2L2 msgEmpty = MixProtoL2.Proto2L2.newBuilder().build();
+    MixProtoL2.Proto2L2 msgNonEmpty =
+        fillProtoL2(MixProtoL2.Proto2L2.newBuilder()).build();
 
     Configuration conf = new Configuration();
     ProtoWriteSupport.setWriteSpecsCompliant(conf, true);
 
     Path outputPath = new WriteUsingMR(conf).write(msgEmpty, msgNonEmpty);
     ReadUsingMR readUsingMR = new ReadUsingMR(conf);
-    String customClass = MixProtoL2.ProtoL2.class.getName();
+    String customClass = MixProtoL2.Proto2L2.class.getName();
     ProtoReadSupport.setProtobufClass(readUsingMR.getConfiguration(), customClass);
     List<Message> result = readUsingMR.read(outputPath);
 
@@ -431,21 +431,21 @@ public class ProtoInputOutputFormatTest {
     assertEquals(msgNonEmpty, result.get(1));
   }
 
-  private MixProtoL1.ProtoL1.Builder fillProtoL1(MixProtoL1.ProtoL1.Builder b) {
+  private MixProtoL1.Proto3L1.Builder fillProtoL1(MixProtoL1.Proto3L1.Builder b) {
     return b.addRepeatedProto3(
-        MixProtoL1.ProtoL1ToL2.newBuilder().addRepeatedProto2(
-            fillProtoL2(MixProtoL2.ProtoL2.newBuilder())
+        MixProtoL1.Proto3L1ToL2.newBuilder().addRepeatedProto2(
+            fillProtoL2(MixProtoL2.Proto2L2.newBuilder())
         ).build()
     );
   }
 
-  private MixProtoL2.ProtoL2.Builder fillProtoL2(MixProtoL2.ProtoL2.Builder b) {
+  private MixProtoL2.Proto2L2.Builder fillProtoL2(MixProtoL2.Proto2L2.Builder b) {
     b.addRepeatedProto2(
         MixProtoL2.ProtoL2ToL3.newBuilder().addRepeatedProto3(
-            MixProtoL3.ProtoL3.newBuilder().addRepeatedProto2(
-                MixProtoL3.ProtoL3ToL4.newBuilder().addRepeatedProto3(
-                    MixProtoL4.ProtoL4.newBuilder().addRepeatedProto2(
-                        MixProtoL4.ProtoL4Terminal.newBuilder().build()
+            MixProtoL3.Proto3L3.newBuilder().addRepeatedProto3(
+                MixProtoL3.ProtoL3ToL4.newBuilder().addRepeatedProto2(
+                    MixProtoL4.Proto2L4.newBuilder().addRepeatedProto2(
+                        MixProtoL4.Proto2L4Terminal.newBuilder().build()
                     ).build()
                 ).build()
             )

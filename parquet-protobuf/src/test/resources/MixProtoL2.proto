@@ -25,20 +25,20 @@ option java_package = "org.apache.parquet.proto.test";
 
 import "MixProtoL3.proto";
 
-message ProtoL2 {
+message Proto2L2 {
 //  required ProtoL2ToL3 proto2 = 1;
   optional ProtoL2ToL3 optionalProto2 = 2;
   repeated ProtoL2ToL3 repeatedProto2 = 3;
-  map<string, ProtoL2ToL3> mapIntProto2 = 4;
+  map<string, ProtoL2ToL3> map1Proto2 = 4;
 
 //  optional ProtoL2 recursive = 5;
 }
 
 message ProtoL2ToL3 {
 //  required ProtoL3 proto3 = 1;
-  optional ProtoL3 optionalProto3 = 2;
-  repeated ProtoL3 repeatedProto3 = 3;
-  map<string, ProtoL3> mapIntProto3 = 4;
+  optional Proto3L3 optionalProto3 = 2;
+  repeated Proto3L3 repeatedProto3 = 3;
+  map<string, Proto3L3> map1Proto3 = 4;
 
 //  optional ProtoL2ToL3 recursive = 5;
 }
