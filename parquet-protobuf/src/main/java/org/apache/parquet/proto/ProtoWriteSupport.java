@@ -23,6 +23,7 @@ import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_ITEM_SEPARAT
 import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_KEY_VALUE_SEPARATOR;
 import static org.apache.parquet.proto.ProtoConstants.METADATA_ENUM_PREFIX;
 
+import com.google.common.collect.MapMaker;
 import com.google.protobuf.BoolValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.BytesValue;
@@ -256,7 +257,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     validatedMapping(descriptor, rootSchema);
 
     this.messageWriter = new MessageWriter(descriptor, rootSchema, protoMessage);
-    createFastMessageWriters(messageWriter);
+    createFastMessageWriters(messageWriter, rootSchema);
 
     extraMetaData.put(ProtoReadSupport.PB_DESCRIPTOR, descriptor.toProto().toString());
     extraMetaData.put(PB_SPECS_COMPLIANT_WRITE, String.valueOf(writeSpecsCompliant));
@@ -1322,21 +1323,21 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
   }
 
-  private void createFastMessageWriters(MessageWriter messageWriter) {
+  private void createFastMessageWriters(MessageWriter messageWriter, MessageType rootSchema) {
     switch (fastMessageWriterMode) {
       case OFF:
         break;
       case REFLECTION:
-        new JavaReflectionProto3FastMessageWriters().createFastMessageWriters(messageWriter);
+        new JavaReflectionProto3FastMessageWriters().createFastMessageWriters(messageWriter, rootSchema);
         break;
       case CODEGEN:
-        new ByteBuddyProto3FastMessageWriters(this).createFastMessageWriters(messageWriter);
+        new ByteBuddyProto3FastMessageWriters(this).createFastMessageWriters(messageWriter, rootSchema);
         break;
       case BEST:
         if (ByteBuddyProto3FastMessageWriters.isByteBuddyAvailable()) {
-          new ByteBuddyProto3FastMessageWriters(this).createFastMessageWriters(messageWriter);
+          new ByteBuddyProto3FastMessageWriters(this).createFastMessageWriters(messageWriter, rootSchema);
         } else {
-          new JavaReflectionProto3FastMessageWriters().createFastMessageWriters(messageWriter);
+          new JavaReflectionProto3FastMessageWriters().createFastMessageWriters(messageWriter, rootSchema);
         }
         break;
     }
@@ -1365,6 +1366,30 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   static class ByteBuddyProto3FastMessageWriters extends Proto3FastMessageWriters {
     static final AtomicLong BYTE_BUDDY_CLASS_SEQUENCE = new AtomicLong();
+
+    final static class CacheKey {
+      final Class<? extends Message> protoMessageClass;
+      final MessageType messageType;
+
+      CacheKey(Class<? extends Message> protoMessageClass, MessageType messageType) {
+        this.protoMessageClass = protoMessageClass;
+        this.messageType = messageType;
+      }
+
+      @Override
+      public boolean equals(Object o) {
+        if (o == null || getClass() != o.getClass()) return false;
+        CacheKey cacheKey = (CacheKey) o;
+        return Objects.equals(protoMessageClass, cacheKey.protoMessageClass) && Objects.equals(messageType, cacheKey.messageType);
+      }
+
+      @Override
+      public int hashCode() {
+        return Objects.hash(protoMessageClass, messageType);
+      }
+    }
+
+    static final Map<CacheKey, Class<? extends ByteBuddyProto3FastMessageWriter>> CACHE = new MapMaker().weakValues().makeMap();
 
     final ProtoWriteSupport<?> protoWriteSupport;
 
@@ -1512,29 +1537,40 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     ByteBuddyProto3FastMessageWriter generateAndInstantiateFastMessageWriter(
-        ProtoWriteSupport<?>.MessageWriter messageWriter) {
-      FastMessageWriterImplementation impl = new FastMessageWriterImplementation(
-          protoWriteSupport,
-          messageWriter);
+        ProtoWriteSupport<?>.MessageWriter messageWriter, MessageType rootSchema) {
 
-      DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
+      CacheKey cacheKey = new CacheKey(messageWriter.protoMessageClass, rootSchema);
+      Class<? extends ByteBuddyProto3FastMessageWriter> writerClass = ByteBuddyProto3FastMessageWriters.CACHE.get(cacheKey);
 
-      try {
-        unloaded.saveIn(new java.io.File("generated_debug"));
-      } catch (Exception e) {
+      if (writerClass == null) {
+        FastMessageWriterImplementation impl = new FastMessageWriterImplementation(
+            protoWriteSupport,
+            messageWriter);
+
+        DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
+
+//       try {
+//         unloaded.saveIn(new java.io.File("generated_debug"));
+//       } catch (Exception e) {
+//       }
+
+        writerClass = unloaded.load(
+                null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
+            .getLoaded();
+        CACHE.put(cacheKey, writerClass);
       }
 
-      Class<? extends ByteBuddyProto3FastMessageWriter> fastMessageWriterClass = unloaded.load(
-              null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
-          .getLoaded();
       return ReflectionUtil.newInstance(
-          ReflectionUtil.getConstructor(fastMessageWriterClass, ProtoWriteSupport.class, ProtoWriteSupport.MessageWriter.class), protoWriteSupport, messageWriter);
+          ReflectionUtil.getConstructor(writerClass, ProtoWriteSupport.class, ProtoWriteSupport.MessageWriter.class), protoWriteSupport, messageWriter);
     }
 
     @Override
-    void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter) {
+    void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter, MessageType rootSchema) {
+      if (messageWriter.protoMessageClass == null) {
+        return;
+      }
       assertOptimizationAvailable();
-      generateAndInstantiateFastMessageWriter(messageWriter).install();
+      generateAndInstantiateFastMessageWriter(messageWriter, rootSchema).install();
     }
 
     @Override
@@ -1543,9 +1579,6 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
         throw new FastMessageWriterCreationException("ByteBuddy optimization for proto3 is not available");
       }
     }
-
-    static final Implementation NOOP = new Implementation.Simple(
-        (methodVisitor, implementationContext, instrumentedMethod) -> new ByteCodeAppender.Size(0, 0));
 
     interface MessageWriterVisitor {
       final class FieldPath {
@@ -3278,7 +3311,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
   }
 
   abstract static class Proto3FastMessageWriters {
-    abstract void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter);
+    abstract void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter, MessageType rootSchema);
 
     void assertOptimizationAvailable() {}
   }
@@ -3719,7 +3752,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     @Override
-    void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter)  {
+    void createFastMessageWriters(ProtoWriteSupport<?>.MessageWriter messageWriter, MessageType rootSchema)  {
       assertOptimizationAvailable();
       Queue<ProtoWriteSupport<?>.FieldWriter> fieldWriters = new LinkedList<>();
       fieldWriters.add(messageWriter);
