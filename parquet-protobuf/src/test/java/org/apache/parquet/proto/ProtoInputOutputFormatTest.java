@@ -33,6 +33,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.proto.test.MixProtoL1;
 import org.apache.parquet.proto.test.MixProtoL2;
+import org.apache.parquet.proto.test.MixProtoL3;
+import org.apache.parquet.proto.test.MixProtoL4;
 import org.apache.parquet.proto.test.TestProto3;
 import org.apache.parquet.proto.test.TestProtobuf;
 import org.apache.parquet.proto.test.TestProtobuf.FirstCustomClassMessage;
@@ -430,10 +432,25 @@ public class ProtoInputOutputFormatTest {
   }
 
   private MixProtoL1.ProtoL1.Builder fillProtoL1(MixProtoL1.ProtoL1.Builder b) {
-    return b;
+    return b.addRepeatedProto3(
+        MixProtoL1.ProtoL1ToL2.newBuilder().addRepeatedProto2(
+            fillProtoL2(MixProtoL2.ProtoL2.newBuilder())
+        ).build()
+    );
   }
 
   private MixProtoL2.ProtoL2.Builder fillProtoL2(MixProtoL2.ProtoL2.Builder b) {
+    b.addRepeatedProto2(
+        MixProtoL2.ProtoL2ToL3.newBuilder().addRepeatedProto3(
+            MixProtoL3.ProtoL3.newBuilder().addRepeatedProto2(
+                MixProtoL3.ProtoL3ToL4.newBuilder().addRepeatedProto3(
+                    MixProtoL4.ProtoL4.newBuilder().addRepeatedProto2(
+                        MixProtoL4.ProtoL4Terminal.newBuilder().build()
+                    ).build()
+                ).build()
+            )
+        )
+    );
     return b;
   }
 

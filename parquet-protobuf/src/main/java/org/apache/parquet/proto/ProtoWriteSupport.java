@@ -1401,13 +1401,15 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           if (fieldWriter instanceof ProtoWriteSupport.MessageWriter) {
             ProtoWriteSupport<?>.MessageWriter writer = (ProtoWriteSupport<?>.MessageWriter) fieldWriter;
             boolean alreadyOptimized = poll.optimized;
-            if (!alreadyOptimized) {
-              if (ReflectionUtil.getProto3MessageOrBuilderInterface(writer.protoMessageClass)
-                  .isPresent()) {
+            if (ReflectionUtil.getProto3MessageOrBuilderInterface(writer.protoMessageClass)
+                .isPresent()) {
+              if (!alreadyOptimized) {
                 FastMessageWriter fastMessageWriter = getFastMessageWriter((ProtoWriteSupport<?>.MessageWriter) fieldWriter).get();
                 writer.setFastMessageWriter(fastMessageWriter);
                 alreadyOptimized = true;
               }
+            } else {
+              alreadyOptimized = false;
             }
             for (ProtoWriteSupport<?>.FieldWriter childFieldWriter : writer.fieldWriters) {
               fieldWriters.add(new FieldWriterAndParentOptimizationStatus(alreadyOptimized, childFieldWriter));
