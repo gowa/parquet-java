@@ -1584,10 +1584,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
 
-      try {
-        unloaded.saveIn(new java.io.File("generated_debug"));
-      } catch (Exception e) {
-      }
+//       try {
+//         unloaded.saveIn(new java.io.File("generated_debug"));
+//       } catch (Exception e) {
+//       }
 
         writerClass = unloaded.load(
                 null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
