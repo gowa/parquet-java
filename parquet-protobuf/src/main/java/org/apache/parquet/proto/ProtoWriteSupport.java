@@ -1527,6 +1527,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                                             List<ProtoWriteSupport<?>.FieldWriter> notOptimizedFieldWriters,
                                             Map<ProtoWriteSupport<?>.FieldWriter, Integer> optimizedFieldWriters) {
         Map<MessageWriterVisitor.MethodKey, Integer> fieldMethodsIndex = new HashMap<>();
+        Map<MessageWriterVisitor.MethodKey, Integer> notOptimizedFieldIndex = new HashMap<>();
 
         MessageWriterVisitor.traverse(new MessageWriterVisitor.RegularField<>(null, new FieldPath(), rootMessageWriter), new MessageWriterVisitor() {
           @Override
@@ -1535,7 +1536,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
               optimizedFieldWriters.put(field.rawValueWriter(), idx);
             } else {
-              notOptimizedFieldWriters.add(field.rawValueWriter());
+              if (!notOptimizedFieldIndex.containsKey(field.asMessageWriterMethodKey())) {
+                notOptimizedFieldIndex.put(field.asMessageWriterMethodKey(), notOptimizedFieldIndex.size());
+                notOptimizedFieldWriters.add(field.rawValueWriter());
+              }
             }
             return true;
           }
@@ -1544,7 +1548,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           public void visitNonMessageWriter(RegularField<?> field) {
             if (field.isBinaryMessage()) {
               fieldMethodsIndex.computeIfAbsent(field.asMessageWriterMethodKey(), k -> fieldMethodsIndex.size());
-              notOptimizedFieldWriters.add(field.rawValueWriter());
+              if (!notOptimizedFieldIndex.containsKey(field.asMessageWriterMethodKey())) {
+                notOptimizedFieldIndex.put(field.asMessageWriterMethodKey(), notOptimizedFieldIndex.size());
+                notOptimizedFieldWriters.add(field.rawValueWriter());
+              }
             }
           }
 
@@ -1590,10 +1597,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         DynamicType.Unloaded<ByteBuddyProto3FastMessageWriter> unloaded = impl.make();
 
-//       try {
-//         unloaded.saveIn(new java.io.File("generated_debug"));
-//       } catch (Exception e) {
-//       }
+      try {
+        unloaded.saveIn(new java.io.File("generated_debug"));
+      } catch (Exception e) {
+      }
 
         writerClass = unloaded.load(
                 null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
@@ -1618,6 +1625,24 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     void assertOptimizationAvailable() {
       if (!isByteBuddyAvailable()) {
         throw new FastMessageWriterCreationException("ByteBuddy optimization for proto3 is not available");
+      }
+    }
+
+    static class MessageWriterIntrospector {
+      private final Map<ProtoWriteSupport<?>.MessageWriter, FieldPath> messageWriterToFieldPath = new LinkedHashMap<>();
+      final Map<ProtoWriteSupport<?>.FieldWriter, Integer> notOptimizedFieldWriters = new LinkedHashMap<>();
+
+      final Map<MessageWriterVisitor.MethodKey, String> fieldPathToMethodNameMap = new LinkedHashMap<>();
+      final Map<MessageWriterVisitor.MethodKey, MethodDescription> fieldPathToMethodDescriptionMap = new LinkedHashMap<>();
+
+      final Map<MessageWriterVisitor.MethodKey, String> mapFieldPathToMethodNameMap = new LinkedHashMap<>();
+      final Map<MessageWriterVisitor.MethodKey, MethodDescription> mapFieldPathToMethodDescriptionMap = new LinkedHashMap<>();
+
+      final Map<String, Integer> enumTypeFullNameToFieldIdx = new LinkedHashMap<>();
+      final Map<String, Class<?>> enumTypeFullNameToClassMap = new LinkedHashMap<>();
+
+      public MessageWriterIntrospector(ProtoWriteSupport<?>.MessageWriter rootMessageWriter) {
+
       }
     }
 
@@ -1941,7 +1966,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
       final ProtoWriteSupport<?> protoWriteSupport;
       final ProtoWriteSupport<?>.MessageWriter rootMessageWriter;
 
-      final Map<ProtoWriteSupport<?>.FieldWriter, Integer> notOptimizedFieldWriters = new LinkedHashMap<>();
+      final Map<MessageWriterVisitor.MethodKey, Integer> notOptimizedFieldWriters = new LinkedHashMap<>();
 
       final Map<MessageWriterVisitor.MethodKey, String> fieldPathToMethodNameMap = new LinkedHashMap<>();
       final Map<MessageWriterVisitor.MethodKey, MethodDescription> fieldPathToMethodDescriptionMap = new LinkedHashMap<>();
@@ -1977,7 +2002,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             registerWriteAllFieldsForMessageMethod(field);
             if (!field.getFieldReflectionTypeProto3MessageOrBuilderInterface()
                 .isPresent()) {
-              notOptimizedFieldWriters.put(field.rawValueWriter(), notOptimizedFieldWriters.size());
+              if (!notOptimizedFieldWriters.containsKey(field.asMessageWriterMethodKey())) {
+                notOptimizedFieldWriters.put(field.asMessageWriterMethodKey(), notOptimizedFieldWriters.size());
+              }
             }
             return true;
           }
@@ -1987,7 +2014,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
             maybeRegisterEnum(field);
             if (field.isBinaryMessage()) {
               registerWriteAllFieldsForMessageMethod(field);
-              notOptimizedFieldWriters.put(field.rawValueWriter(), notOptimizedFieldWriters.size());
+              if (!notOptimizedFieldWriters.containsKey(field.asMessageWriterMethodKey())) {
+                notOptimizedFieldWriters.put(field.asMessageWriterMethodKey(), notOptimizedFieldWriters.size());
+              }
             }
           }
 
@@ -2511,7 +2540,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
               add(MethodVariableAccess.loadThis());
             } else {
               add(MethodVariableAccess.loadThis(),
-                  IntegerConstant.forValue(notOptimizedFieldWriters.get(field.rawValueWriter())));
+                  IntegerConstant.forValue(notOptimizedFieldWriters.get(field.asMessageWriterMethodKey())));
             }
           }
 
@@ -2567,7 +2596,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
                 }
               });
             } else {
-              Integer idx = notOptimizedFieldWriters.get(field.rawValueWriter());
+              Integer idx = notOptimizedFieldWriters.get(field.asMessageWriterMethodKey());
               if (idx == null) {
                 throw new IllegalStateException("field: " + field);
               }
@@ -2696,7 +2725,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
           @Override
           void beforeLoadValueOnStack() {
-            Integer idx = notOptimizedFieldWriters.get(field.rawValueWriter());
+            Integer idx = notOptimizedFieldWriters.get(field.asMessageWriterMethodKey());
             if (idx == null) {
               throw new IllegalStateException("field: " + field);
             }
