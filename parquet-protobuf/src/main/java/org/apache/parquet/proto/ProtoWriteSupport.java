@@ -31,7 +31,6 @@ import com.google.type.Date;
 import com.google.type.TimeOfDay;
 import com.twitter.elephantbird.util.Protobufs;
 import java.lang.reflect.Array;
-import java.lang.reflect.Method;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.*;
@@ -169,11 +168,7 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     this.messageWriter = new MessageWriter(descriptor, rootSchema);
 
-    ByteBuddyCodeGen.Introspector introspector = null;
-    if (protoMessage != null) {
-      introspector = new ByteBuddyCodeGen.Introspector(this.messageWriter, descriptor, protoMessage, false);
-    }
-
+    ByteBuddyCodeGen.WriteSupport.tryApplyAlternativeMessageFieldsWriters(messageWriter, rootSchema, protoMessage, descriptor, configuration);
 
     extraMetaData.put(ProtoReadSupport.PB_DESCRIPTOR, descriptor.toProto().toString());
     extraMetaData.put(PB_SPECS_COMPLIANT_WRITE, String.valueOf(writeSpecsCompliant));
@@ -250,6 +245,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     final FieldWriter[] fieldWriters;
 
+    MessageFieldsWriter alternativeMessageWriter = MessageFieldsWriter.NOOP;
+
     @SuppressWarnings("unchecked")
     MessageWriter(Descriptor descriptor, GroupType schema) {
       List<FieldDescriptor> fields = descriptor.getFields();
@@ -272,6 +269,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
         fieldWriters[fieldDescriptor.getIndex()] = writer;
       }
+    }
+
+    ProtoWriteSupport<T> getProtoWriteSupport() {
+      return ProtoWriteSupport.this;
     }
 
     private FieldWriter createWriter(FieldDescriptor fieldDescriptor, Type type) {
@@ -434,6 +435,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     }
 
     private void writeAllFields(MessageOrBuilder pb) {
+      if (alternativeMessageWriter.writeAllFields(pb)) {
+        return;
+      }
+
       Descriptor messageDescriptor = pb.getDescriptorForType();
       Descriptors.FileDescriptor.Syntax syntax =
           messageDescriptor.getFile().getSyntax();
@@ -474,6 +479,10 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           fieldWriter.writeField(pb.getField(fieldDescriptor));
         }
       }
+    }
+
+    void setAlternativeMessageWriter(MessageFieldsWriter alternativeMessageWriter) {
+      this.alternativeMessageWriter = alternativeMessageWriter;
     }
   }
 
@@ -591,8 +600,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
   class MapWriter extends FieldWriter {
 
-    private final FieldWriter keyWriter;
-    private final FieldWriter valueWriter;
+    final FieldWriter keyWriter;
+    final FieldWriter valueWriter;
 
     public MapWriter(FieldWriter keyWriter, FieldWriter valueWriter) {
       super();
@@ -680,9 +689,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           ? (ByteString) value
           // TODO: figure out a way to use MessageOrBuilder
           : value instanceof Message
-              ? ((Message) value).toByteString()
-              // Worst-case, just dump as plain java string.
-              : ByteString.copyFromUtf8(value.toString());
+          ? ((Message) value).toByteString()
+          // Worst-case, just dump as plain java string.
+          : ByteString.copyFromUtf8(value.toString());
       Binary binary = Binary.fromConstantByteArray(byteString.toByteArray());
       recordConsumer.addBinary(binary);
     }
@@ -787,436 +796,32 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
     throw new InvalidRecordException(exceptionMsg);
   }
 
-  // --------- ByteBuddy CodeGen -----------
-  static class ByteBuddyCodeGen {
-    static class CodeGenException extends RuntimeException {
-      public CodeGenException() {
-        super();
-      }
+  /**
+   * A plugin for {@link MessageWriter#writeAllFields(MessageOrBuilder)} that is potentially
+   * capable to write MessageOrBuilder fields faster.
+   */
+  public interface MessageFieldsWriter {
+    MessageFieldsWriter NOOP = messageOrBuilder -> false;
 
-      public CodeGenException(String message) {
-        super(message);
-      }
+    /**
+     * Performs all the steps that {@link MessageWriter#writeAllFields(MessageOrBuilder)}
+     * would normally do, but faster.
+     * @param messageOrBuilder
+     * @return true if this writer has written fields of the passed messageOrBuilder
+     *         false otherwise
+     */
+    boolean writeAllFields(MessageOrBuilder messageOrBuilder);
+  }
 
-      public CodeGenException(String message, Throwable cause) {
-        super(message, cause);
-      }
+  RecordConsumer getRecordConsumer() {
+    return recordConsumer;
+  }
 
-      public CodeGenException(Throwable cause) {
-        super(cause);
-      }
-    }
+  Map<String, Map<String, Integer>> getProtoEnumBookKeeper() {
+    return protoEnumBookKeeper;
+  }
 
-    static class ReflectionUtil {
-      static Method getDeclaredMethod(Class<?> clazz, String name, Class<?>... parameterTypes) {
-        try {
-          return clazz.getDeclaredMethod(name, parameterTypes);
-        } catch (NoSuchMethodException e) {
-          throw new CodeGenException(e);
-        }
-      }
-
-      static Method getDeclaredMethod(
-          Class<?> protoClazz,
-          FieldDescriptor fieldDescriptor,
-          String name,
-          Class<?>... parameters) {
-        return getDeclaredMethod(
-            protoClazz,
-            name.replace("{}", getFieldNameForMethod(fieldDescriptor)),
-            parameters);
-      }
-
-      static Method getDeclaredMethodByName(Class<?> clazz, String name) {
-        for (Method method : clazz.getDeclaredMethods()) {
-          if (name.equals(method.getName())) {
-            return method;
-          }
-        }
-        throw new CodeGenException("no such method on class " + clazz + ": " + name);
-      }
-
-      static Method getDeclaredMethodByName(Class<?> clazz, FieldDescriptor fieldDescriptor, String name) {
-        return getDeclaredMethodByName(clazz, name.replace("{}", getFieldNameForMethod(fieldDescriptor)));
-      }
-
-      // almost the same as com.google.protobuf.Descriptors.FieldDescriptor#fieldNameToJsonName
-      // but capitalizing the first letter after each last digit
-      static String getFieldNameForMethod(FieldDescriptor fieldDescriptor) {
-        String name = fieldDescriptor.getType() == FieldDescriptor.Type.GROUP
-            ? fieldDescriptor.getMessageType().getName()
-            : fieldDescriptor.getName();
-        final int length = name.length();
-        StringBuilder result = new StringBuilder(length);
-        boolean isNextUpperCase = false;
-        for (int i = 0; i < length; i++) {
-          char ch = name.charAt(i);
-          if (ch == '_') {
-            isNextUpperCase = true;
-          } else if ('0' <= ch && ch <= '9') {
-            isNextUpperCase = true;
-            result.append(ch);
-          } else if (isNextUpperCase || i == 0) {
-            // This closely matches the logic for ASCII characters in:
-            // http://google3/google/protobuf/descriptor.cc?l=249-251&rcl=228891689
-            if ('a' <= ch && ch <= 'z') {
-              ch = (char) (ch - 'a' + 'A');
-            }
-            result.append(ch);
-            isNextUpperCase = false;
-          } else {
-            result.append(ch);
-          }
-        }
-        return result.toString();
-      }
-    }
-
-    static class Field {
-      private final Field parent;
-      private final ProtoWriteSupport<?>.FieldWriter fieldWriter;
-
-      private final FieldDescriptor fieldDescriptor; // can be null for root MessageWriter
-      private final Descriptor messageType; // filled for Message fields (incl. Map)
-
-      private java.lang.reflect.Type reflectionType;
-
-      private Field(Field parent, ProtoWriteSupport<?>.FieldWriter fieldWriter, FieldDescriptor fieldDescriptor) {
-        this.parent = parent;
-        this.fieldWriter = fieldWriter;
-        this.fieldDescriptor = fieldDescriptor;
-        this.messageType = fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.MESSAGE ? fieldDescriptor.getMessageType() : null;
-      }
-
-      public Field(ProtoWriteSupport<?>.MessageWriter messageWriter, Class<? extends Message> protoMessage, Descriptor messageType) {
-        this.parent = null;
-        this.fieldWriter = messageWriter;
-        this.fieldDescriptor = null;
-        this.messageType = messageType;
-        this.reflectionType = protoMessage;
-      }
-
-      public Field getParent() {
-        return parent;
-      }
-
-      // helps codegen to deal with particular java getter for a proto field
-      public java.lang.reflect.Type getReflectionType() {
-        if (reflectionType == null) {
-          reflectionType = initReflectionType();
-        }
-        return reflectionType;
-      }
-
-      private java.lang.reflect.Type initReflectionType() {
-        // parent is always not null here
-        if (isMap()) {
-          return initMapReflectionType();
-        } else if (parent.isMap()) {
-          MapReflectionType mapReflectionType = (MapReflectionType) parent.getReflectionType();
-          return fieldDescriptor.getNumber() == 0 ? mapReflectionType.key() : mapReflectionType.value();
-        } else {
-          return initRegularFieldReflectionType();
-        }
-      }
-
-      private java.lang.reflect.Type initRegularFieldReflectionType() {
-        Class<?> clazz;
-        Class<?> parentProtoMessage = (Class<?>) parent.getReflectionType();
-        if (fieldDescriptor.isRepeated()) {
-          clazz = ReflectionUtil.getDeclaredMethod(parentProtoMessage, fieldDescriptor, "get{}", int.class).getReturnType();
-        } else {
-          clazz = ReflectionUtil.getDeclaredMethod(parentProtoMessage, fieldDescriptor, "get{}").getReturnType();
-        }
-        if (fieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM) {
-          return new EnumReflectionType(clazz, fieldDescriptor);
-        }
-        return clazz;
-      }
-
-      private java.lang.reflect.Type initMapReflectionType() {
-        Class<?> parentProtoMessage = (Class<?>) parent.getReflectionType();
-        Method method = ReflectionUtil.getDeclaredMethodByName(parentProtoMessage, fieldDescriptor, "get{}OrThrow");
-        FieldDescriptor valueFieldDescriptor = fieldDescriptor.getMessageType().getFields().get(1);
-        java.lang.reflect.Type valueType;
-        if (valueFieldDescriptor.getJavaType() == FieldDescriptor.JavaType.ENUM) {
-          valueType = new EnumReflectionType(method.getReturnType(), valueFieldDescriptor);
-        } else {
-          valueType = method.getReturnType();
-        }
-        return new MapReflectionType(method.getParameterTypes()[0], valueType);
-      }
-
-      // helps codegen to identify unique methods and supporting fields to write messages, map entries and enums
-      public java.lang.reflect.Type getCodeGenerationKey() {
-        java.lang.reflect.Type myReflectionType = getReflectionType();
-        if (isMessage() || (isMap() && getChildren().get(1).isMessage())) {
-          Field f = this.getParent();
-          int depth = 0;
-          while (f != null) {
-            if (Objects.equals(myReflectionType, f.getReflectionType())) {
-              depth += 1;
-            }
-            f = f.getParent();
-          }
-          return new CodeGenerationKey(myReflectionType, depth);
-        }
-        if (isMap()) {
-          return new CodeGenerationKey(myReflectionType, 0);
-        }
-        if (isEnumWriter()) {
-          // for enums extra fields have to be prepared and their content depend on Enum type itself, not on the declaring message type
-          return ((EnumReflectionType) myReflectionType).asCodeGenerationKey();
-        }
-        throw new CodeGenException("no code generation is allowed for this field");
-      }
-
-      public ProtoWriteSupport<?>.FieldWriter getFieldWriter() {
-        return fieldWriter;
-      }
-
-      public FieldDescriptor getFieldDescriptor() {
-        return fieldDescriptor;
-      }
-
-      public List<Field> getChildren() {
-        if (isMessage()) {
-          ProtoWriteSupport<?>.FieldWriter[] fieldWriters = asMessageWriter().fieldWriters;
-          return resolveChildFields(fieldWriters);
-        } else if (isMap()) {
-          ProtoWriteSupport<?>.FieldWriter[] fieldWriters = new ProtoWriteSupport<?>.FieldWriter[]{getMapKeyWriter(), getMapValueWriter()};
-          return resolveChildFields(fieldWriters);
-        } else {
-          return Collections.emptyList();
-        }
-      }
-
-      private List<Field> resolveChildFields(ProtoWriteSupport<?>.FieldWriter[] fieldWriters) {
-        List<FieldDescriptor> fieldDescriptors = messageType.getFields();
-        int fieldsCount = fieldWriters.length;
-        List<Field> result = new ArrayList<>(fieldsCount);
-        for (int i = 0; i < fieldsCount; i++) {
-          result.add(resolveField(fieldWriters[i], fieldDescriptors.get(i)));
-        }
-        return result;
-      }
-
-      public boolean isMessage() {
-        // this does not include Map and Message fields written as binary
-        return !isMap() && fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter;
-      }
-
-      private ProtoWriteSupport<?>.MessageWriter asMessageWriter() {
-        if (!isMessage()) {
-          throw new CodeGenException();
-        }
-        return (ProtoWriteSupport<?>.MessageWriter) fieldWriter;
-      }
-
-      public boolean isProto2() {
-        if (!isMessage()) {
-          throw new CodeGenException();
-        }
-        return messageType.getFile().getSyntax() == Descriptors.FileDescriptor.Syntax.PROTO2;
-      }
-
-      public boolean isMap() {
-        // fieldDescriptor is null for root message which is message, not map.
-        return fieldDescriptor != null && fieldDescriptor.isMapField();
-      }
-
-      private ProtoWriteSupport<?>.FieldWriter getMapKeyWriter() {
-        if (!isMap()) {
-          throw new CodeGenException();
-        }
-        if (fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-          return ((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[0];
-        } else if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-          return ((ProtoWriteSupport<?>.MapWriter) fieldWriter).keyWriter;
-        } else {
-          throw new CodeGenException();
-        }
-      }
-
-      private ProtoWriteSupport<?>.FieldWriter getMapValueWriter() {
-        if (!isMap()) {
-          throw new CodeGenException();
-        }
-        if (fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-          return ((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[1];
-        } else if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-          return ((ProtoWriteSupport<?>.MapWriter) fieldWriter).valueWriter;
-        } else {
-          throw new CodeGenException();
-        }
-      }
-
-      public boolean isEnumWriter() {
-        return fieldWriter instanceof ProtoWriteSupport<?>.EnumWriter;
-      }
-
-      public ProtoWriteSupport<?>.EnumWriter asEnumWriter() {
-        if (!isEnumWriter()) {
-          throw new CodeGenException();
-        }
-        return (ProtoWriteSupport<?>.EnumWriter) fieldWriter;
-      }
-
-      private Field resolveField(ProtoWriteSupport<?>.FieldWriter fieldWriter, FieldDescriptor fieldDescriptor) {
-        if (fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter) {
-          return resolveField(((ProtoWriteSupport<?>.ArrayWriter) fieldWriter).fieldWriter, fieldDescriptor);
-        } else if (fieldWriter instanceof ProtoWriteSupport<?>.RepeatedWriter) {
-          return resolveField(((ProtoWriteSupport<?>.RepeatedWriter) fieldWriter).fieldWriter, fieldDescriptor);
-        } else {
-          return new Field(this, fieldWriter, fieldDescriptor);
-        }
-      }
-    }
-
-    static final class MapReflectionType implements java.lang.reflect.Type {
-      private final java.lang.reflect.Type key;
-      private final java.lang.reflect.Type value;
-
-      public MapReflectionType(java.lang.reflect.Type key, java.lang.reflect.Type value) {
-        this.key = key;
-        this.value = value;
-      }
-
-      public java.lang.reflect.Type key() {
-        return key;
-      }
-
-      public java.lang.reflect.Type value() {
-        return value;
-      }
-
-      @Override
-      public boolean equals(Object o) {
-        if (o == null || getClass() != o.getClass()) return false;
-        MapReflectionType that = (MapReflectionType) o;
-        return Objects.equals(key, that.key) && Objects.equals(value, that.value);
-      }
-
-      @Override
-      public int hashCode() {
-        return Objects.hash(key, value);
-      }
-    }
-
-    static final class CodeGenerationKey implements java.lang.reflect.Type {
-      private final java.lang.reflect.Type type;
-      private final int depth;
-
-      public CodeGenerationKey(java.lang.reflect.Type type, int depth) {
-        this.type = type;
-        this.depth = depth;
-      }
-
-      @Override
-      public boolean equals(Object o) {
-        if (o == null || getClass() != o.getClass()) return false;
-        CodeGenerationKey that = (CodeGenerationKey) o;
-        return depth == that.depth && Objects.equals(type, that.type);
-      }
-
-      @Override
-      public int hashCode() {
-        return Objects.hash(type, depth);
-      }
-    }
-
-    static final class EnumReflectionType implements java.lang.reflect.Type {
-      private final Class<?> clazz;
-      private final boolean enumSupportsUnknownValues; // determines if Enum actually supports unknown values
-      private final Boolean fieldSupportsUnknownValues; // only used to help identify which getter to use for enums
-
-      public EnumReflectionType(Class<?> clazz, FieldDescriptor enumField) {
-        this.clazz = clazz;
-        this.enumSupportsUnknownValues = !enumField.getEnumType().isClosed();
-        this.fieldSupportsUnknownValues = !enumField.legacyEnumFieldTreatedAsClosed();
-      }
-
-      private EnumReflectionType(Class<?> clazz, boolean enumSupportsUnknownValues) {
-        this.clazz = clazz;
-        this.enumSupportsUnknownValues = enumSupportsUnknownValues;
-        this.fieldSupportsUnknownValues = null;
-      }
-
-      public EnumReflectionType asCodeGenerationKey() {
-        return new EnumReflectionType(clazz, enumSupportsUnknownValues);
-      }
-
-      @Override
-      public boolean equals(Object o) {
-        if (o == null || getClass() != o.getClass()) return false;
-        EnumReflectionType that = (EnumReflectionType) o;
-        return enumSupportsUnknownValues == that.enumSupportsUnknownValues && Objects.equals(clazz, that.clazz) && Objects.equals(fieldSupportsUnknownValues, that.fieldSupportsUnknownValues);
-      }
-
-      @Override
-      public int hashCode() {
-        return Objects.hash(clazz, enumSupportsUnknownValues, fieldSupportsUnknownValues);
-      }
-    }
-
-    private interface FieldVisitor {
-      void visitField(Field field);
-    }
-
-    private static void scan(Field startField, FieldVisitor visitor) {
-      Queue<Field> queue = new ArrayDeque<>();
-      queue.add(startField);
-
-      while (!queue.isEmpty()) {
-        Field field = queue.poll();
-        visitor.visitField(field);
-        queue.addAll(field.getChildren());
-      }
-    }
-
-    static class Introspector {
-      private final Map<java.lang.reflect.Type, FieldIndex> proto2MessageWriters = new LinkedHashMap<>();
-      private final Map<java.lang.reflect.Type, FieldIndex> codeGenMessageWriters = new LinkedHashMap<>();
-      private final Map<java.lang.reflect.Type, FieldIndex> mapWriters = new LinkedHashMap<>();
-      private final Map<java.lang.reflect.Type, FieldIndex> enumFields = new LinkedHashMap<>();
-
-      private static class FieldIndex {
-        private final Field field;
-        private final int index;
-
-        private FieldIndex(Field field, int index) {
-          this.field = field;
-          this.index = index;
-        }
-      }
-
-      public Introspector(ProtoWriteSupport<?>.MessageWriter messageWriter,
-                          Descriptors.Descriptor descriptor,
-                          Class<? extends Message> protoMessage,
-                          boolean proto2CodeGen) {
-        scan(new Field(messageWriter, protoMessage, descriptor), new FieldVisitor() {
-          @Override
-          public void visitField(Field field) {
-            if (field.isMessage() ) {
-              java.lang.reflect.Type key = field.getCodeGenerationKey();
-              addFieldIndex(key, field, !proto2CodeGen && field.isProto2() ? proto2MessageWriters : codeGenMessageWriters);
-            } else if (field.isMap()) {
-              java.lang.reflect.Type key = field.getCodeGenerationKey();
-              addFieldIndex(key, field, mapWriters);
-            } else if (field.isEnumWriter()) {
-              java.lang.reflect.Type key = field.getCodeGenerationKey();
-              addFieldIndex(key, field, enumFields);
-            }
-          }
-        });
-      }
-
-      private void addFieldIndex(java.lang.reflect.Type key, Field field, Map<java.lang.reflect.Type, FieldIndex> registry) {
-        if (registry.containsKey(key)) {
-          return;
-        }
-        registry.put(key, new FieldIndex(field, registry.size()));
-      }
-    }
+  boolean isWriteSpecsCompliant() {
+    return writeSpecsCompliant;
   }
 }
