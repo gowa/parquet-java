@@ -41,6 +41,7 @@ import org.apache.parquet.conf.ParquetConfiguration;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.io.api.RecordConsumer;
 import org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Codegen;
+import org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Implementations;
 import org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.LocalVar;
 import org.apache.parquet.schema.MessageType;
 
@@ -52,6 +53,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Type;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.*;
@@ -65,6 +67,9 @@ import static org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Reflection;
 
 class ByteBuddyCodeGen {
   private static final AtomicLong BYTE_BUDDY_CLASS_SEQUENCE = new AtomicLong();
+
+  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessageV3 = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessageV3");
+  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessage");
 
   static class CodeGenException extends RuntimeException {
     public CodeGenException() {
@@ -85,12 +90,7 @@ class ByteBuddyCodeGen {
   }
 
   static boolean isByteBuddyAvailable() {
-    try {
-      Class.forName("net.bytebuddy.ByteBuddy", false, ByteBuddyCodeGen.class.getClassLoader());
-      return true;
-    } catch (ClassNotFoundException e) {
-      return false;
-    }
+    return ReflectionUtil.classForName("net.bytebuddy.ByteBuddy").isPresent();
   }
 
   static class CodeGenUtils {
@@ -102,7 +102,7 @@ class ByteBuddyCodeGen {
       final RecordConsumerMethods RecordConsumer = new RecordConsumerMethods();
       final ByteBuddyProto3FastMessageWriterMethods ByteBuddyProto3FastMessageWriter =
           new ByteBuddyProto3FastMessageWriterMethods();
-      final ProtoWriteSupportMethods ProtoWriteSupport = new ProtoWriteSupportMethods();
+      final FieldWriterMethods FieldWriter = new FieldWriterMethods();
 
       static class RecordConsumerMethods {
         final Method startField =
@@ -143,9 +143,8 @@ class ByteBuddyCodeGen {
         private ByteBuddyProto3FastMessageWriterMethods() {}
       }
 
-      static class ProtoWriteSupportMethods {
-        final Method convertMessageOrBuilderToBinary =
-            ReflectionUtil.getDeclaredMethod(ProtoWriteSupport.class, "convertMessageOrBuilderToBinary", MessageOrBuilder.class);
+      static class FieldWriterMethods {
+        final Method writeRawValue = ReflectionUtil.getDeclaredMethod(ProtoWriteSupport.FieldWriter.class, "writeRawValue", Object.class);
       }
 
       private ResolvedReflection() {}
@@ -256,7 +255,7 @@ class ByteBuddyCodeGen {
           throw new IllegalStateException();
         }
         flushOngoing();
-        compound = new Implementation.Compound(implementations);
+        compound = new Compound(implementations);
         return compound.prepare(instrumentedType);
       }
 
@@ -267,7 +266,7 @@ class ByteBuddyCodeGen {
       }
 
       public Implementations add(ByteCodeAppender... appenders) {
-        return add(new Implementation.Simple(appenders));
+        return add(new Simple(appenders));
       }
 
       public Implementations add(StackManipulation... stackManipulations) {
@@ -277,7 +276,7 @@ class ByteBuddyCodeGen {
 
       private void flushOngoing() {
         if (!ongoing.isEmpty()) {
-          implementations.add(new Implementation.Simple(ongoing.toArray(new StackManipulation[0])));
+          implementations.add(new Simple(ongoing.toArray(new StackManipulation[0])));
           ongoing.clear();
         }
       }
@@ -558,11 +557,12 @@ class ByteBuddyCodeGen {
         Class<? extends Message> messageClass) {
       return Stream.of(messageClass)
           .filter(Objects::nonNull)
-          .filter(x -> {
-            String superClassName = x.getSuperclass().getName();
-            return superClassName.equals("com.google.protobuf.GeneratedMessageV3")
-                || superClassName.equals("com.google.protobuf.GeneratedMessage");
-          })
+          .filter(x ->
+              (com_google_protobuf_GeneratedMessageV3.isPresent()
+                  && com_google_protobuf_GeneratedMessageV3.get().isAssignableFrom(x))
+              || (com_google_protobuf_GeneratedMessage.isPresent()
+                  && com_google_protobuf_GeneratedMessage.get().isAssignableFrom(x))
+          )
           .flatMap(x -> Arrays.stream(x.getInterfaces()))
           .filter(MessageOrBuilder.class::isAssignableFrom)
           .map(x -> (Class<? extends MessageOrBuilder>) x)
@@ -650,6 +650,14 @@ class ByteBuddyCodeGen {
           throw (CodeGenException) e.getCause();
         }
         throw new CodecException(e.getCause());
+      }
+    }
+
+    static Optional<Class<?>> classForName(String className) {
+      try {
+        return Optional.of(Class.forName(className, false, ByteBuddyCodeGen.class.getClassLoader()));
+      } catch (ClassNotFoundException e) {
+        return Optional.empty();
       }
     }
   }
@@ -773,8 +781,6 @@ class ByteBuddyCodeGen {
       return false;
     }
 
-
-
     static class Field {
       private final FieldScanner fieldScanner;
       private final Field parent;
@@ -783,15 +789,21 @@ class ByteBuddyCodeGen {
       private final Descriptors.FieldDescriptor fieldDescriptor; // can be null for root MessageWriter
       private final Descriptors.Descriptor messageType; // filled for Message fields (incl. Map)
 
-      private java.lang.reflect.Type reflectionType;
+      private final String parquetFieldName;
+      private final int parquetFieldIndex;
+
+      private Type reflectionType;
+      private Object codeGenerationBasicType;
 
       private Field(FieldScanner fieldScanner, Field parent, ProtoWriteSupport<?>.FieldWriter fieldWriter,
-                    Descriptors.FieldDescriptor fieldDescriptor) {
+                    Descriptors.FieldDescriptor fieldDescriptor, String parquetFieldName, int parquetFieldIndex) {
         this.fieldScanner = fieldScanner;
         this.parent = parent;
         this.fieldWriter = fieldWriter;
         this.fieldDescriptor = fieldDescriptor;
         this.messageType = fieldDescriptor.getJavaType() == Descriptors.FieldDescriptor.JavaType.MESSAGE ? fieldDescriptor.getMessageType() : null;
+        this.parquetFieldName = parquetFieldName;
+        this.parquetFieldIndex = parquetFieldIndex;
       }
 
       private Field(FieldScanner fieldScanner, ProtoWriteSupport<?>.MessageWriter messageWriter,
@@ -802,18 +814,32 @@ class ByteBuddyCodeGen {
         this.fieldDescriptor = null;
         this.messageType = messageType;
         this.reflectionType = protoMessage;
+        this.parquetFieldName = null;
+        this.parquetFieldIndex = -1;
       }
 
       public String getParquetFieldName() {
-        return fieldWriter.fieldName;
+        return parquetFieldName;
       }
 
       public int getParquetFieldIndex() {
-        return fieldWriter.index;
+        return parquetFieldIndex;
       }
 
       public Field getParent() {
         return parent;
+      }
+
+      @Override
+      public String toString() {
+        List<String> path = new ArrayList<>();
+        Field p = this;
+        while (p != null) {
+          path.add(p.getParquetFieldName());
+          p = p.getParent();
+        }
+        Collections.reverse(path);
+        return String.valueOf(path);
       }
 
       public Descriptors.Descriptor getMessageType() {
@@ -821,7 +847,7 @@ class ByteBuddyCodeGen {
       }
 
       // helps codegen to deal with particular java getter for a proto field
-      public java.lang.reflect.Type getReflectionType() {
+      public Type getReflectionType() {
         if (reflectionType == null) {
           reflectionType = initReflectionType();
         }
@@ -839,19 +865,19 @@ class ByteBuddyCodeGen {
         return !isMap() && fieldDescriptor != null && fieldDescriptor.isRepeated();
       }
 
-      private java.lang.reflect.Type initReflectionType() {
+      private Type initReflectionType() {
         // parent is always not null here
         if (isMap()) {
           return initMapReflectionType();
         } else if (parent.isMap()) {
           MapReflectionType mapReflectionType = (MapReflectionType) parent.getReflectionType();
-          return fieldDescriptor.getNumber() == 0 ? mapReflectionType.key() : mapReflectionType.value();
+          return fieldDescriptor.getIndex() == 0 ? mapReflectionType.key() : mapReflectionType.value();
         } else {
           return initRegularFieldReflectionType();
         }
       }
 
-      private java.lang.reflect.Type initRegularFieldReflectionType() {
+      private Type initRegularFieldReflectionType() {
         Class<?> clazz;
         Class<?> parentProtoMessage = (Class<?>) parent.getReflectionType();
         if (fieldDescriptor.isRepeated()) {
@@ -865,11 +891,11 @@ class ByteBuddyCodeGen {
         return clazz;
       }
 
-      private java.lang.reflect.Type initMapReflectionType() {
+      private Type initMapReflectionType() {
         Class<?> parentProtoMessage = (Class<?>) parent.getReflectionType();
         Method method = ReflectionUtil.getDeclaredMethodByName(parentProtoMessage, fieldDescriptor, "get{}OrThrow");
         Descriptors.FieldDescriptor valueFieldDescriptor = fieldDescriptor.getMessageType().getFields().get(1);
-        java.lang.reflect.Type valueType;
+        Type valueType;
         if (valueFieldDescriptor.getJavaType() == Descriptors.FieldDescriptor.JavaType.ENUM) {
           valueType = new EnumReflectionType(method.getReturnType(), valueFieldDescriptor);
         } else {
@@ -880,17 +906,16 @@ class ByteBuddyCodeGen {
 
       // helps codegen to identify unique methods and supporting fields to write messages, map entries and enums
       public Object getCodeGenerationElementKey() {
-        if (isProtoMessage() || (isMap() && getChildren().get(1).isProtoMessage())) {
-          Object myType = getCodeGenerationBasicType();
-          Field f = this.getParent();
-          int depth = 0;
-          while (f != null) {
-            if (Objects.equals(myType, f.getCodeGenerationBasicType())) {
-              depth += 1;
-            }
-            f = f.getParent();
+        if (isMessage() || (isMap() && getChildren().get(1).isMessage())) {
+          Field parent = getParent();
+          if (parent == null) {
+            return getCodeGenerationBasicType();
+          } else {
+            return Arrays.asList(getCodeGenerationBasicType(), parent.getCodeGenerationElementKey());
           }
-          return Arrays.asList(myType, depth);
+        }
+        if (isBinaryMessage() || (isMap() && getChildren().get(1).isBinaryMessage())) {
+          return getCodeGenerationBasicType();
         }
         if (isMap()) {
           return getCodeGenerationBasicType();
@@ -903,20 +928,19 @@ class ByteBuddyCodeGen {
       }
 
       private Object getCodeGenerationBasicType() {
+        if (codeGenerationBasicType == null) {
+          codeGenerationBasicType = initCodeGenerationBasicType();
+        }
+        return codeGenerationBasicType;
+      }
+
+      private Object initCodeGenerationBasicType() {
         if (isMap()) {
-          Object keyType = getChildren().get(0).getFieldDescriptor().getJavaType();
-          Object valueType;
-          Field valueField = getChildren().get(1);
-          if (valueField.isProtoMessage()) {
-            valueType = valueField.getMessageType();
-          } else if (valueField.isEnum()) {
-            valueType = Arrays.asList(valueField.getFieldDescriptor().getEnumType(), valueField.getFieldDescriptor().legacyEnumFieldTreatedAsClosed());
-          } else {
-            valueType = valueField.getFieldDescriptor().getJavaType();
-          }
+          Object keyType = mapKey().getCodeGenerationBasicType();
+          Object valueType = mapValue().getCodeGenerationBasicType();
           return Arrays.asList(keyType, valueType);
         } else if (isProtoMessage()) {
-          return getMessageType();
+          return Arrays.asList(isBinaryMessage() ? "binary_message" : "message", getMessageType());
         } else if (isEnum()) {
           return Arrays.asList(getFieldDescriptor().getEnumType(), getFieldDescriptor().legacyEnumFieldTreatedAsClosed());
         } else {
@@ -933,8 +957,7 @@ class ByteBuddyCodeGen {
           ProtoWriteSupport<?>.FieldWriter[] fieldWriters = getMessageWriter().fieldWriters;
           return resolveChildFields(fieldWriters);
         } else if (isMap()) {
-          ProtoWriteSupport<?>.FieldWriter[] fieldWriters = new ProtoWriteSupport<?>.FieldWriter[] {getMapKeyWriter(), getMapValueWriter()};
-          return resolveChildFields(fieldWriters);
+          return Arrays.asList(mapKey(), mapValue());
         } else {
           return Collections.emptyList();
         }
@@ -952,11 +975,15 @@ class ByteBuddyCodeGen {
 
       public boolean isMessage() {
         // this does not include Map and Message fields written as binary
-        return !isMap() && fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter;
+        return isProtoMessage() && fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter;
+      }
+
+      public boolean isBinaryMessage() {
+        return isProtoMessage() && fieldWriter instanceof ProtoWriteSupport<?>.BinaryWriter;
       }
 
       public boolean isProtoMessage() {
-        return !isMap() && messageType != null;
+        return !isMap() && !isProtoWrapper() && messageType != null;
       }
 
       private ProtoWriteSupport<?>.MessageWriter getMessageWriter() {
@@ -966,11 +993,7 @@ class ByteBuddyCodeGen {
         return (ProtoWriteSupport<?>.MessageWriter) fieldWriter;
       }
 
-      public boolean isProtoReflectionMessage() {
-        if (!isMessage()) {
-          throw new CodeGenException();
-        }
-
+      public boolean isFieldWriterFallback() {
         // track only those 'protobuf reflection writers that are children of codegen writers'
         Field parent = getParent();
         while (parent != null) {
@@ -980,10 +1003,17 @@ class ByteBuddyCodeGen {
           parent = parent.getParent();
         }
 
-        return fieldScanner.isProtoReflectionForProto2()
-            && isProto2Message()
-            && parent != null
-            && !parent.isProtoReflectionMessage();
+        return parent != null
+            && !parent.isFieldWriterFallback()
+            && isFieldWriterFallback0();
+      }
+
+      private boolean isFieldWriterFallback0() {
+        if (isBinaryMessage())
+          return true;
+        if (isMessage() && fieldScanner.isFieldWriterFallbackForProto2() && isProto2Message())
+          return true;
+        return false;
       }
 
       private boolean isProto2Message() {
@@ -998,27 +1028,27 @@ class ByteBuddyCodeGen {
         return fieldDescriptor != null && fieldDescriptor.isMapField();
       }
 
-      private ProtoWriteSupport<?>.FieldWriter getMapKeyWriter() {
+      private Field mapKey() {
         if (!isMap()) {
           throw new CodeGenException();
         }
         if (fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-          return ((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[0];
+          return resolveField(((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[0], messageType.getFields().get(0));
         } else if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-          return ((ProtoWriteSupport<?>.MapWriter) fieldWriter).keyWriter;
+          return resolveField(((ProtoWriteSupport<?>.MapWriter) fieldWriter).keyWriter, messageType.getFields().get(0));
         } else {
           throw new CodeGenException();
         }
       }
 
-      private ProtoWriteSupport<?>.FieldWriter getMapValueWriter() {
+      private Field mapValue() {
         if (!isMap()) {
           throw new CodeGenException();
         }
         if (fieldWriter instanceof ProtoWriteSupport<?>.MessageWriter) {
-          return ((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[1];
+          return resolveField(((ProtoWriteSupport<?>.MessageWriter) fieldWriter).fieldWriters[1], messageType.getFields().get(1));
         } else if (fieldWriter instanceof ProtoWriteSupport<?>.MapWriter) {
-          return ((ProtoWriteSupport<?>.MapWriter) fieldWriter).valueWriter;
+          return resolveField(((ProtoWriteSupport<?>.MapWriter) fieldWriter).valueWriter, messageType.getFields().get(1));
         } else {
           throw new CodeGenException();
         }
@@ -1030,34 +1060,75 @@ class ByteBuddyCodeGen {
 
       private Field resolveField(ProtoWriteSupport<?>.FieldWriter fieldWriter,
                                  Descriptors.FieldDescriptor fieldDescriptor) {
+        return resolveField(fieldWriter, fieldDescriptor, fieldWriter);
+      }
+
+      private Field resolveField(ProtoWriteSupport<?>.FieldWriter fieldWriter,
+                                 Descriptors.FieldDescriptor fieldDescriptor, ProtoWriteSupport<?>.FieldWriter parquetFieldInfo) {
         if (fieldWriter instanceof ProtoWriteSupport<?>.ArrayWriter) {
-          return resolveField(((ProtoWriteSupport<?>.ArrayWriter) fieldWriter).fieldWriter, fieldDescriptor);
+          return resolveField(((ProtoWriteSupport<?>.ArrayWriter) fieldWriter).fieldWriter, fieldDescriptor, fieldWriter);
         } else if (fieldWriter instanceof ProtoWriteSupport<?>.RepeatedWriter) {
-          return resolveField(((ProtoWriteSupport<?>.RepeatedWriter) fieldWriter).fieldWriter, fieldDescriptor);
+          return resolveField(((ProtoWriteSupport<?>.RepeatedWriter) fieldWriter).fieldWriter, fieldDescriptor, fieldWriter);
         } else {
-          return new Field(fieldScanner, this, fieldWriter, fieldDescriptor);
+          return new Field(fieldScanner, this, fieldWriter, fieldDescriptor, parquetFieldInfo.fieldName, parquetFieldInfo.index);
         }
       }
 
       public boolean isOptional() {
         return !isMap() && !isList() && fieldDescriptor != null && fieldDescriptor.hasPresence();
       }
+
+      public boolean isPrimitive() {
+        switch (fieldDescriptor.getJavaType()) {
+          case INT:
+          case LONG:
+          case FLOAT:
+          case DOUBLE:
+          case BOOLEAN:
+            return true;
+          default:
+            return false;
+        }
+      }
+
+      public boolean isBinary() {
+        return fieldDescriptor.getJavaType() == Descriptors.FieldDescriptor.JavaType.BYTE_STRING;
+      }
+
+      public boolean isString() {
+        return fieldDescriptor.getJavaType() == Descriptors.FieldDescriptor.JavaType.STRING;
+      }
+
+      public boolean isProtoWrapper() {
+        return fieldWriter instanceof ProtoWriteSupport<?>.BytesValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.StringValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.BoolValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.UInt32ValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.Int32ValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.UInt64ValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.Int64ValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.FloatValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.DoubleValueWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.TimeWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.DateWriter
+            || fieldWriter instanceof ProtoWriteSupport<?>.TimestampWriter;
+      }
     }
 
-    static final class MapReflectionType implements java.lang.reflect.Type {
-      private final java.lang.reflect.Type key;
-      private final java.lang.reflect.Type value;
+    static final class MapReflectionType implements Type {
+      private final Type key;
+      private final Type value;
 
-      public MapReflectionType(java.lang.reflect.Type key, java.lang.reflect.Type value) {
+      public MapReflectionType(Type key, Type value) {
         this.key = key;
         this.value = value;
       }
 
-      public java.lang.reflect.Type key() {
+      public Type key() {
         return key;
       }
 
-      public java.lang.reflect.Type value() {
+      public Type value() {
         return value;
       }
 
@@ -1082,7 +1153,7 @@ class ByteBuddyCodeGen {
       }
     }
 
-    static final class EnumReflectionType implements java.lang.reflect.Type {
+    static final class EnumReflectionType implements Type {
       private final Class<?> clazz;
       private final boolean enumSupportsUnknownValues; // determines if Enum actually supports unknown values
       private final boolean fieldSupportsUnknownValues; // only used to help identify which getter to use for enums
@@ -1122,14 +1193,14 @@ class ByteBuddyCodeGen {
     }
 
     static class FieldScanner {
-      private final boolean protoReflectionForProto2;
+      private final boolean fieldWriterFallbackForProto2;
 
-      private FieldScanner(boolean protoReflectionForProto2) {
-        this.protoReflectionForProto2 = protoReflectionForProto2;
+      private FieldScanner(boolean fieldWriterFallbackForProto2) {
+        this.fieldWriterFallbackForProto2 = fieldWriterFallbackForProto2;
       }
 
-      public boolean isProtoReflectionForProto2() {
-        return protoReflectionForProto2;
+      public boolean isFieldWriterFallbackForProto2() {
+        return fieldWriterFallbackForProto2;
       }
 
       public void scan(ProtoWriteSupport<?>.MessageWriter messageWriter, Class<? extends Message> protoMessage,
@@ -1157,10 +1228,10 @@ class ByteBuddyCodeGen {
 
       private final Map<Object, CodeGenMessageWriter> codeGenMessageWriters = new LinkedHashMap<>();
       private final Map<Object, CodeGenMapWriter> mapWriters = new LinkedHashMap<>();
-      private final Map<Object, CodeGenProtoReflectionMessageWriter> protoReflectionMessageWriters = new LinkedHashMap<>();
+      private final Map<Object, CodeGenFieldWriterFallback> fieldWriterFallbacks = new LinkedHashMap<>();
       private final Map<Object, CodeGenEnum> enumFields = new LinkedHashMap<>();
 
-      private final DynamicType.Builder<ByteBuddyMessageWriters>[] classBuilder;
+      private DynamicType.Builder<ByteBuddyMessageWriters> classBuilder;
       private final Class<? extends ByteBuddyMessageWriters> byteBuddyMessageWritersClass;
 
       public ByteBuddyMessageWritersCodeGen(ProtoWriteSupport<?>.MessageWriter messageWriter,
@@ -1174,38 +1245,79 @@ class ByteBuddyCodeGen {
 
         collectCodeGenElements(messageWriter, protoMessage, descriptor);
 
-        classBuilder = new DynamicType.Builder[]{
-            new ByteBuddy()
+        classBuilder = new ByteBuddy()
                 .subclass(ByteBuddyMessageWriters.class)
                 .name(ByteBuddyMessageWriters.class.getName() + "$Generated$"
-                + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet())
-        };
+                + BYTE_BUDDY_CLASS_SEQUENCE.incrementAndGet());
 
         registerEnumFields();
+        registerFallbackFieldWriterFields();
         generateConstructor();
         generateMethods();
+        overrideSetFallbackFieldWriters();
 
-        byteBuddyMessageWritersClass = classBuilder[0]
-            .make()
+        DynamicType.Unloaded<ByteBuddyMessageWriters> unloaded = classBuilder
+            .make();
+
+      try {
+        unloaded.saveIn(new java.io.File("generated_debug"));
+      } catch (Exception e) {
+      }
+
+        byteBuddyMessageWritersClass = unloaded
             .load(null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
             .getLoaded();
       }
 
-      private void generateMethods() {
+      private void registerFallbackFieldWriterFields() {
+        for (CodeGenFieldWriterFallback fieldWriterFallback : fieldWriterFallbacks.values()) {
+          classBuilder = classBuilder.define(fieldWriterFallback.fieldWriter());
+        }
+      }
 
+      private void overrideSetFallbackFieldWriters() {
+        classBuilder = classBuilder.method(ElementMatchers.named("setFallbackFieldWriters")).intercept(new Implementations() {{
+          CodeGenUtils.LocalVars localVars = new CodeGenUtils.LocalVars();
+          try (LocalVar thisLocalVar = localVars.register(classBuilder.toTypeDescription())) {
+            try (LocalVar fieldWriters = localVars.register(ProtoWriteSupport.FieldWriter[].class)) {
+              for (CodeGenFieldWriterFallback fieldWriterFallback : fieldWriterFallbacks.values()) {
+                add(MethodVariableAccess.loadThis(),
+                    fieldWriters.load(),
+                    IntegerConstant.forValue(fieldWriterFallback.getId()),
+                    ArrayAccess.REFERENCE.load(),
+                    FieldAccess.forField(fieldWriterFallback.fieldWriter()).write()
+                );
+              }
+            }
+          }
+
+          add(Codegen.returnVoid());
+        }});
+      }
+
+      private void generateMethods() {
+        for (CodeGenMessageWriter codeGenMessageWriter : codeGenMessageWriters.values()) {
+          classBuilder = classBuilder.define(codeGenMessageWriter.getMethodDescription())
+              .intercept(new WriteAllFieldsForMessageImplementation(codeGenMessageWriter.getField()));
+        }
+
+        for (CodeGenMapWriter codeGenMapWriter : mapWriters.values()) {
+          classBuilder = classBuilder.define(codeGenMapWriter.writeMapEntry())
+              .intercept(new WriteAllFieldsForMapEntryImplementation(codeGenMapWriter.getField()));
+        }
       }
 
       private void generateConstructor() {
-        classBuilder[0] = classBuilder[0]
+        classBuilder = classBuilder
             .constructor(ElementMatchers.any())
             .intercept(SuperMethodCall.INSTANCE.andThen(new ByteBuddyMessageWritersConstructor()));
       }
 
       private void registerEnumFields() {
         for (CodeGenEnum enumField : enumFields.values()) {
-          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), enumField.enumNumberPairs()));
-          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), enumField.enumDescriptor()));
-          classBuilder[0] = classBuilder[0].define(new FieldDescription.Latent(classBuilder[0].toTypeDescription(), enumField.enumValues()));
+          classBuilder = classBuilder.define(enumField.enumNumberPairs());
+          classBuilder = classBuilder.define(enumField.enumDescriptor());
+          classBuilder = classBuilder.define(enumField.enumValues());
         }
       }
 
@@ -1214,25 +1326,20 @@ class ByteBuddyCodeGen {
         fieldScanner.scan(messageWriter, protoMessage, descriptor, new FieldVisitor() {
           @Override
           public void visitField(Field field) {
-            if (field.isMessage()) {
-              Object key = field.getCodeGenerationElementKey();
-              if (field.isProtoReflectionMessage()) {
-                addCodeGenElement(key, field, protoReflectionMessageWriters, CodeGenProtoReflectionMessageWriter::new);
-              } else {
-                addCodeGenElement(key, field, codeGenMessageWriters, CodeGenMessageWriter::new);
-              }
+            if (field.isFieldWriterFallback()) {
+              addCodeGenElement(field, fieldWriterFallbacks, CodeGenFieldWriterFallback::new);
+            } else if (field.isMessage()) {
+              addCodeGenElement(field, codeGenMessageWriters, CodeGenMessageWriter::new);
             } else if (field.isMap()) {
-              Object key = field.getCodeGenerationElementKey();
-              addCodeGenElement(key, field, mapWriters, CodeGenMapWriter::new);
+              addCodeGenElement(field, mapWriters, CodeGenMapWriter::new);
             } else if (field.isEnum()) {
-              Object key = field.getCodeGenerationElementKey();
-              addCodeGenElement(key, field, enumFields, CodeGenEnum::new);
+              addCodeGenElement(field, enumFields, CodeGenEnum::new);
             }
           }
         });
       }
 
-      private class ByteBuddyMessageWritersConstructor extends CodeGenUtils.Implementations {
+      private class ByteBuddyMessageWritersConstructor extends Implementations {
 
         public ByteBuddyMessageWritersConstructor() {
           // final Map<String, Integer> enumNameNumberPairs<idx>;
@@ -1244,30 +1351,22 @@ class ByteBuddyCodeGen {
                 MethodVariableAccess.loadThis(),
                 new TextConstant(enumField.getEnumTypeFullName()),
                 Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.enumNameNumberPairs),
-                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                    .filter(ElementMatchers.named(enumField.enumNumberPairs().getName()))
-                    .getOnly()).write()
+                FieldAccess.forField(enumField.enumNumberPairs()).write()
             );
 
             add(MethodVariableAccess.loadThis(),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumField.getEnumClass(), "getDescriptor")),
-                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                    .filter(ElementMatchers.named(enumField.enumDescriptor().getName()))
-                    .getOnly()).write()
+                FieldAccess.forField(enumField.enumDescriptor()).write()
             );
 
             add(MethodVariableAccess.loadThis(),
                 MethodVariableAccess.loadThis(),
-                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                    .filter(ElementMatchers.named(enumField.enumDescriptor().getName()))
-                    .getOnly()).read(),
+                FieldAccess.forField(enumField.enumDescriptor()).read(),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "getValues")),
                 ArrayFactory.forType(TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor.class)).withValues(Collections.emptyList()),
                 Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(List.class, "toArray", Object[].class)),
                 TypeCasting.to(TypeDescription.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)),
-                FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                    .filter(ElementMatchers.named(enumField.enumValues().getName()))
-                    .getOnly()).write()
+                FieldAccess.forField(enumField.enumValues()).write()
             );
           }
 
@@ -1275,8 +1374,8 @@ class ByteBuddyCodeGen {
         }
       }
 
-      private abstract class FastMessageWriterMethodBase extends CodeGenUtils.Implementations {
-        private final CodeGenUtils.LocalVars localVars = new CodeGenUtils.LocalVars();
+      private abstract class FastMessageWriterMethodBase extends Implementations {
+        final CodeGenUtils.LocalVars localVars = new CodeGenUtils.LocalVars();
 
         @Override
         public InstrumentedType prepare(InstrumentedType instrumentedType) {
@@ -1284,23 +1383,7 @@ class ByteBuddyCodeGen {
           return super.prepare(instrumentedType);
         }
 
-        protected void writeMessageFields(Field field) {
-          Class<? extends MessageOrBuilder> messageOrBuilderInterface = field.getMessageOrBuilderInterface();
-
-          try (LocalVar messageOrBuilderArg = localVars.register(messageOrBuilderInterface)) {
-            localVars.frameEmptyStack();
-
-            try (LocalVar proto3MessageOrBuilder = messageOrBuilderArg.alias()) {
-              try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
-                add(Codegen.storeRecordConsumer(recordConsumerVar));
-                add(new MessageFieldWriter(field, recordConsumerVar).writeMessageFieldsInternal(proto3MessageOrBuilder));
-              }
-            }
-            add(Codegen.returnVoid());
-          }
-        }
-
-        abstract class RegularFieldWriterTemplate extends CodeGenUtils.Implementations {
+        abstract class RegularFieldWriterTemplate extends Implementations {
           final Field field;
           final LocalVar recordConsumerVar;
 
@@ -1539,14 +1622,15 @@ class ByteBuddyCodeGen {
 
           @Override
           void convertRawValueAndWrite() {
-            if (!field.isProtoReflectionMessage()) {
-              MethodDescription methodDescription = fieldPathToMethodDescriptionMap.get(field.asMessageWriterMethodKey());
-              if (methodDescription == null) {
-                throw new IllegalStateException("field: " + field);
+            if (!field.isFieldWriterFallback()) {
+              CodeGenMessageWriter codeGenMessageWriter = codeGenMessageWriters.get(field.getCodeGenerationElementKey());
+              if (codeGenMessageWriter == null) {
+                throw new CodeGenException("field: " + field);
               }
+              MethodDescription methodDescription = codeGenMessageWriter.getMethodDescription();
               add(MethodInvocation.invoke(methodDescription));
             } else {
-              add(Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.writeNotOptimizedMessageFieldRawValue));
+              add(Codegen.invokeMethod(Reflection.FieldWriter.writeRawValue));
             }
           }
 
@@ -1557,42 +1641,18 @@ class ByteBuddyCodeGen {
                 Codegen.invokeProtoMethod(
                     proto3MessageOrBuilder.clazz(),
                     getterMethodTemplate(),
-                    field.protoDescriptor(),
+                    field.getFieldDescriptor(),
                     int.class));
           }
 
-//           Implementation writeFromVar(LocalVar var) {
-//             add(recordConsumerVar.load(),
-//                 new TextConstant(field.parquetFieldName()),
-//                 IntegerConstant.forValue(field.parquetFieldIndex()),
-//                 Codegen.invokeMethod(Reflection.RecordConsumer.startField)
-//             );
-//             if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
-//               startGroup();
-//               writeMessageFieldsInternal(var);
-//               endGroup();
-//             } else {
-//               add(MethodVariableAccess.loadThis(),
-//                   IntegerConstant.forValue(notOptimizedFieldWriters.get(field.rawValueWriter())),
-//                   var.load());
-//               convertRawValueAndWrite();
-//             }
-//             add(recordConsumerVar.load(),
-//                 new TextConstant(field.parquetFieldName()),
-//                 IntegerConstant.forValue(field.parquetFieldIndex()),
-//                 Codegen.invokeMethod(Reflection.RecordConsumer.endField)
-//             );
-//             return this;
-//           }
-
           @Override
           void beforeLoadValueOnStack() {
-            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+            if (!field.isFieldWriterFallback()) {
               startGroup();
               add(MethodVariableAccess.loadThis());
             } else {
               add(MethodVariableAccess.loadThis(),
-                  IntegerConstant.forValue(notOptimizedMessageFieldWriters.get(field.asMessageWriterMethodKey())));
+                  FieldAccess.forField(fieldWriterFallbacks.get(field.getCodeGenerationElementKey()).fieldWriter()).read());
             }
           }
 
@@ -1602,12 +1662,12 @@ class ByteBuddyCodeGen {
                 Codegen.invokeProtoMethod(
                     proto3MessageOrBuilder.clazz(),
                     getterMethodTemplate(),
-                    field.protoDescriptor()));
+                    field.getFieldDescriptor()));
           }
 
           @Override
           void afterConvertRawValue() {
-            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
+            if (!field.isFieldWriterFallback()) {
               endGroup();
             }
           }
@@ -1625,64 +1685,48 @@ class ByteBuddyCodeGen {
           Implementation writeMessageFieldsInternal(
               LocalVar proto3MessageOrBuilder) {
 
-            if (field.getFieldReflectionTypeProto3MessageOrBuilderInterface().isPresent()) {
-              MessageWriterVisitor.traverse((MessageWriterVisitor.RegularField) field, new MessageWriterVisitor() {
-                @Override
-                public boolean visitMessageWriter(RegularField<?> field) {
-                  if (field == MessageFieldWriter.this.field) {
-                    return true;
-                  }
-                  add(writeMessageField(proto3MessageOrBuilder, recordConsumerVar, field));
-                  return false;
+            if (!field.isFieldWriterFallback()) {
+              for (Field child : field.getChildren()) {
+                if (child.isProtoMessage()) {
+                  add(writeMessageField(proto3MessageOrBuilder, recordConsumerVar, child));
+                } else if (child.isMap()) {
+                  add(writeMapField(child, proto3MessageOrBuilder));
+                } else {
+                  add(writeNonMessageRegularField(child, proto3MessageOrBuilder));
                 }
-
-                @Override
-                public void visitNonMessageWriter(RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-                  add(writeNonMessageRegularField(field, proto3MessageOrBuilder));
-                }
-
-                @Override
-                public boolean visitMapWriter(MapField field) {
-                  add(writeMapField(field, proto3MessageOrBuilder));
-                  return false;
-                }
-              });
-            } else {
-              Integer idx = notOptimizedMessageFieldWriters.get(field.asMessageWriterMethodKey());
-              if (idx == null) {
-                throw new IllegalStateException("field: " + field);
               }
+            } else {
               add(MethodVariableAccess.loadThis(),
-                  IntegerConstant.forValue(idx),
+                  FieldAccess.forField(fieldWriterFallbacks.get(field.getCodeGenerationElementKey()).fieldWriter()).read(),
                   proto3MessageOrBuilder.load(),
-                  Codegen.invokeMethod(Reflection.ByteBuddyProto3FastMessageWriter.writeNotOptimizedMessageFieldRawValue)
+                  Codegen.invokeMethod(Reflection.FieldWriter.writeRawValue)
               );
             }
 
             return this;
           }
 
-          private Implementation writeMapField(MessageWriterVisitor.MapField field, LocalVar proto3MessageOrBuilder) {
+          private Implementation writeMapField(Field field, LocalVar proto3MessageOrBuilder) {
             return new Implementations() {{
-              MethodDescription methodDescription = mapFieldPathToMethodDescriptionMap.get(field.asMessageWriterMethodKey());
-              if (methodDescription == null) {
-                throw new IllegalStateException("field: " + field);
-              }
+              CodeGenMapWriter codeGenMapWriter = mapWriters.get(field.getCodeGenerationElementKey());
+              MethodDescription methodDescription = codeGenMapWriter.writeMapEntry();
 
-              TypeDescription keyType = TypeDescription.ForLoadedType.of(field.fieldWriter.getFieldReflectionType().getKey()).asBoxed();
-              TypeDescription valueType = TypeDescription.ForLoadedType.of(field.value().isEnum() ? Integer.class : field.fieldWriter.getFieldReflectionType().getValue()).asBoxed();
+              Class<?>[] parameters = codeGenMapWriter.writeMapEntryParameters();
+
+              TypeDescription keyType = TypeDescription.ForLoadedType.of(parameters[0]).asBoxed();
+              TypeDescription valueType = TypeDescription.ForLoadedType.of(parameters[1]).asBoxed();
 
               Label after = new Label();
               add(proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),"get{}Count", field.protoDescriptor()),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),"get{}Count", field.getFieldDescriptor()),
                   Codegen.jumpTo(Opcodes.IFLE, after),
 
                   recordConsumerVar.load(),
-                  new TextConstant(field.parquetFieldName()),
-                  IntegerConstant.forValue(field.parquetFieldIndex()),
+                  new TextConstant(field.getParquetFieldName()),
+                  IntegerConstant.forValue(field.getParquetFieldIndex()),
                   Codegen.invokeMethod(Reflection.RecordConsumer.startField));
 
-              if (writeSpecsCompliant()) {
+              if (protoWriteSupport.isWriteSpecsCompliant()) {
                 add(
                     recordConsumerVar.load(),
                     Codegen.invokeMethod(Reflection.RecordConsumer.startGroup),
@@ -1694,7 +1738,7 @@ class ByteBuddyCodeGen {
               }
 
               add(proto3MessageOrBuilder.load(),
-                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),"get{}" + (field.value().isEnum() ? "Value" : "") + "Map", field.protoDescriptor()),
+                  Codegen.invokeProtoMethod(proto3MessageOrBuilder.clazz(),codeGenMapWriter.getter(), field.getFieldDescriptor()),
                   MethodVariableAccess.loadThis());
 
               add(new StackManipulation.Simple(new StackManipulation.Simple.Dispatcher() {
@@ -1702,7 +1746,7 @@ class ByteBuddyCodeGen {
                 public StackManipulation.Size apply(MethodVisitor methodVisitor, Context implementationContext) {
                   methodVisitor.visitInvokeDynamicInsn(
                       "accept",
-                      "(" + classBuilder[0].toTypeDescription().getDescriptor()+ ")Ljava/util/function/BiConsumer;",
+                      "(" + classBuilder.toTypeDescription().getDescriptor()+ ")Ljava/util/function/BiConsumer;",
                       new Handle(
                           Opcodes.H_INVOKESTATIC,
                           "java/lang/invoke/LambdaMetafactory",
@@ -1711,7 +1755,7 @@ class ByteBuddyCodeGen {
                       JavaConstantValue.Visitor.INSTANCE.onMethodType(JavaConstant.MethodType.of(void.class, Object.class, Object.class)),
                       new Handle(
                           Opcodes.H_INVOKEVIRTUAL,
-                          classBuilder[0].toTypeDescription().getInternalName(),
+                          classBuilder.toTypeDescription().getInternalName(),
                           methodDescription.getInternalName(),
                           methodDescription.getDescriptor(), false),
                       JavaConstantValue.Visitor.INSTANCE.onMethodType(JavaConstant.MethodType.of(TypeDescription.ForLoadedType.of(void.class), keyType, valueType))
@@ -1721,7 +1765,7 @@ class ByteBuddyCodeGen {
               }));
               add(Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "forEach", BiConsumer.class)));
 
-              if (writeSpecsCompliant()) {
+              if (protoWriteSupport.isWriteSpecsCompliant()) {
                 add(
                     recordConsumerVar.load(),
                     new TextConstant("key_value"),
@@ -1733,8 +1777,8 @@ class ByteBuddyCodeGen {
               }
 
               add(recordConsumerVar.load(),
-                  new TextConstant(field.parquetFieldName()),
-                  IntegerConstant.forValue(field.parquetFieldIndex()),
+                  new TextConstant(field.getParquetFieldName()),
+                  IntegerConstant.forValue(field.getParquetFieldIndex()),
                   Codegen.invokeMethod(Reflection.RecordConsumer.endField));
 
               add(Codegen.visitLabel(after),
@@ -1744,7 +1788,7 @@ class ByteBuddyCodeGen {
           }
 
           protected Implementation writeNonMessageRegularField(
-              MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
+              Field field,
               LocalVar proto3MessageOrBuilder) {
             if (field.isPrimitive()) {
               return writePrimitiveField(proto3MessageOrBuilder, recordConsumerVar, field);
@@ -1755,31 +1799,9 @@ class ByteBuddyCodeGen {
             } else if (field.isProtoWrapper()) {
               return writeProtoWrapperField(proto3MessageOrBuilder, recordConsumerVar, field);
             } else if (field.isEnum()) {
-              return writeEnumField(proto3MessageOrBuilder, recordConsumerVar, (MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.EnumWriter>) field);
-            } else if (field.isBinaryMessage()) {
-              return writeBinaryMessageField(proto3MessageOrBuilder, recordConsumerVar, field);
+              return writeEnumField(proto3MessageOrBuilder, recordConsumerVar, field);
             }
-            throw new IllegalStateException("field: " + field);
-          }
-
-          private Implementation writeBinaryMessageField(LocalVar proto3MessageOrBuilder, LocalVar recordConsumerVar,
-                                                         MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field) {
-            return new BinaryMessageFieldWriter(field, recordConsumerVar).fieldGetConvertWrite(proto3MessageOrBuilder);
-          }
-        }
-
-        class BinaryMessageFieldWriter extends RegularFieldWriterTemplate {
-
-          BinaryMessageFieldWriter(MessageWriterVisitor.RegularField<? extends ProtoWriteSupport<?>.FieldWriter> field,
-                                   LocalVar recordConsumerVar) {
-            super(field, recordConsumerVar);
-          }
-
-          @Override
-          void convertRawValueAndWrite() {
-            add(Codegen.invokeMethod(Reflection.ProtoWriteSupport.convertMessageOrBuilderToBinary),
-                Codegen.invokeMethod(Reflection.RecordConsumer.addBinary)
-            );
+            throw new CodeGenException("field: " + field);
           }
         }
 
@@ -1897,13 +1919,13 @@ class ByteBuddyCodeGen {
                 );
               }
             } else if (fieldWriter instanceof ProtoWriteSupport<?>.DateWriter) {
-              try (LocalVar date = localVars.register(com.google.type.Date.class)) {
+              try (LocalVar date = localVars.register(Date.class)) {
                 add(
                     date.store(),
                     date.load(),
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(com.google.type.Date.class, "getYear")),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getYear")),
                     date.load(),
-                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(com.google.type.Date.class, "getMonth")),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getMonth")),
                     date.load(),
                     Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Date.class, "getDay")),
                     Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(LocalDate.class, "of", int.class, int.class, int.class)),
@@ -1931,7 +1953,12 @@ class ByteBuddyCodeGen {
           }
 
           String getterMethodTemplate() {
-            return "get{}Value";
+            return "get{}" + (supportsUnknownValues() ? "Value" : "");
+          }
+
+          boolean supportsUnknownValues() {
+            EnumReflectionType enumReflectionType = (EnumReflectionType) field.getReflectionType();
+            return enumReflectionType.enumSupportsUnknownValues && enumReflectionType.fieldSupportsUnknownValues;
           }
 
           @Override
@@ -1945,8 +1972,17 @@ class ByteBuddyCodeGen {
           void beforeLoadValueOnStack() {
           }
 
+          @Override
+          void convertRawValueAndWrite() {
+            if (supportsUnknownValues()) {
+              convertRawValueAndWriteWithUnknownValues();
+            } else {
+              convertRawValueAndWriteWithoutUnknownValues();
+            }
+          }
+
           /**
-           *         int enumNumber = getEnumValue.getValue(object);
+           *         int enumNumber = messageOrBuilder.getEnumValue();
            *         ProtocolMessageEnum enum_ = forNumber.apply(enumNumber);
            *         Enum<?> javaEnum = (Enum<?>) enum_;
            *         Descriptors.EnumValueDescriptor enumValueDescriptor;
@@ -1956,13 +1992,11 @@ class ByteBuddyCodeGen {
            *           enumValueDescriptor = enumDescriptor.findValueByNumberCreatingIfUnknown(enumNumber);
            *         }
            */
-          @Override
-          void convertRawValueAndWrite() {
-            ProtoWriteSupport<?>.EnumWriter enumWriter = (ProtoWriteSupport<?>.EnumWriter) field.rawValueWriter();
-            String enumTypeFullName = enumWriter.fieldDescriptor.getEnumType().getFullName();
+          void convertRawValueAndWriteWithUnknownValues() {
+            CodeGenEnum codeGenEnum = enumFields.get(field.getCodeGenerationElementKey());
+            Class<?> enumClass = codeGenEnum.clazz;
 
             try(LocalVar enumNumber = localVars.register(int.class)) {
-              Class<?> enumClass = enumTypeFullNameToClassMap.get(enumTypeFullName);
               add(enumNumber.store(),
                   enumNumber.load(),
                   Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(enumClass, "forNumber", int.class))
@@ -1976,9 +2010,7 @@ class ByteBuddyCodeGen {
                 Label afterEnumValueResolved = new Label();
                 add(Codegen.jumpTo(Opcodes.IFNULL, ifEnumRefIsNull),
                     MethodVariableAccess.loadThis(),
-                    FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                        .filter(ElementMatchers.named("enumValues" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                        .getOnly()).read(),
+                    FieldAccess.forField(codeGenEnum.enumValues()).read(),
                     enumRef.load(),
                     Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Enum.class, "ordinal")),
                     ArrayAccess.REFERENCE.load(),
@@ -1986,42 +2018,64 @@ class ByteBuddyCodeGen {
                     Codegen.visitLabel(ifEnumRefIsNull),
                     localVars.frameEmptyStack(),
                     MethodVariableAccess.loadThis(),
-                    FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                        .filter(ElementMatchers.named("enumDescriptor" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                        .getOnly()).read(),
+                    FieldAccess.forField(codeGenEnum.enumDescriptor()).read(),
                     enumNumber.load(),
                     Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumDescriptor.class, "findValueByNumberCreatingIfUnknown", int.class)),
                     Codegen.visitLabel(afterEnumValueResolved),
                     localVars.frameSame1(Descriptors.EnumValueDescriptor.class)
                 );
 
-                try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
-                  add(enumValueDesc.store());
-                  try (LocalVar enumValueDescName = localVars.register(String.class)) {
-                    add(enumValueDesc.load(),
-                        Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
-                        enumValueDescName.store(),
-                        enumValueDescName.load(),
-                        Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
-                    );
-                    try (LocalVar binary = localVars.register(Binary.class)) {
-                      add(binary.store(),
-                          recordConsumerVar.load(),
-                          binary.load(),
-                          Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
-                          MethodVariableAccess.loadThis(),
-                          FieldAccess.forField(classBuilder[0].toTypeDescription().getDeclaredFields()
-                              .filter(ElementMatchers.named("enumNameNumberPairs" + enumTypeFullNameToFieldIdx.get(enumTypeFullName)))
-                              .getOnly()).read(),
-                          enumValueDescName.load(),
-                          enumValueDesc.load(),
-                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
-                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
-                          Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
-                          Removal.SINGLE
-                      );
-                    }
-                  }
+                writeEnumValueDesc(codeGenEnum);
+              }
+            }
+          }
+
+          /**
+           *         Enum<?> javaEnum = messageOrBuilder.getEnum();
+           *         enumValueDescriptor = enumValues.get(javaEnum.ordinal());
+           */
+          void convertRawValueAndWriteWithoutUnknownValues() {
+            CodeGenEnum codeGenEnum = enumFields.get(field.getCodeGenerationElementKey());
+            Class<?> enumClass = codeGenEnum.clazz;
+
+            try(LocalVar enumRef = localVars.register(enumClass)) {
+              add(
+                  enumRef.store(),
+                  MethodVariableAccess.loadThis(),
+                  FieldAccess.forField(codeGenEnum.enumValues()).read(),
+                  enumRef.load(),
+                  Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Enum.class, "ordinal")),
+                  ArrayAccess.REFERENCE.load()
+              );
+
+              writeEnumValueDesc(codeGenEnum);
+            }
+          }
+
+          private void writeEnumValueDesc(CodeGenEnum codeGenEnum) {
+            try (LocalVar enumValueDesc = localVars.register(Descriptors.EnumValueDescriptor.class)) {
+              add(enumValueDesc.store());
+              try (LocalVar enumValueDescName = localVars.register(String.class)) {
+                add(enumValueDesc.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getName")),
+                    enumValueDescName.store(),
+                    enumValueDescName.load(),
+                    Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Binary.class, "fromString", String.class))
+                );
+                try (LocalVar binary = localVars.register(Binary.class)) {
+                  add(binary.store(),
+                      recordConsumerVar.load(),
+                      binary.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.addBinary),
+                      MethodVariableAccess.loadThis(),
+                      FieldAccess.forField(codeGenEnum.enumNumberPairs()).read(),
+                      enumValueDescName.load(),
+                      enumValueDesc.load(),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Descriptors.EnumValueDescriptor.class, "getNumber")),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Integer.class, "valueOf", int.class)),
+                      Codegen.invokeMethod(ReflectionUtil.getDeclaredMethod(Map.class, "putIfAbsent", Object.class, Object.class)),
+                      Removal.SINGLE
+                  );
                 }
               }
             }
@@ -2029,7 +2083,78 @@ class ByteBuddyCodeGen {
         }
       }
 
-      abstract static class CodeGenElement {
+      class WriteAllFieldsForMessageImplementation extends FastMessageWriterMethodBase {
+        WriteAllFieldsForMessageImplementation(Field field) {
+
+          try (LocalVar thisLocalVar = localVars.register(classBuilder.toTypeDescription())) {
+            writeMessageFields(field);
+          }
+        }
+
+        private void writeMessageFields(Field field) {
+          Class<? extends MessageOrBuilder> messageOrBuilderInterface = field.getMessageOrBuilderInterface();
+
+          try (LocalVar messageOrBuilderArg = localVars.register(messageOrBuilderInterface)) {
+            localVars.frameEmptyStack();
+
+            try (LocalVar proto3MessageOrBuilder = messageOrBuilderArg.alias()) {
+              try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
+                add(Codegen.storeRecordConsumer(recordConsumerVar));
+                add(new MessageFieldWriter(field, recordConsumerVar).writeMessageFieldsInternal(proto3MessageOrBuilder));
+              }
+            }
+            add(Codegen.returnVoid());
+          }
+        }
+      }
+
+      class WriteAllFieldsForMapEntryImplementation extends FastMessageWriterMethodBase {
+
+        WriteAllFieldsForMapEntryImplementation(Field field) {
+          CodeGenMapWriter codeGenMapWriter = mapWriters.get(field.getCodeGenerationElementKey());
+          Class<?>[] methodParameters = codeGenMapWriter.writeMapEntryParameters();
+          try (LocalVar thisLocalVar = localVars.register(classBuilder.toTypeDescription())) {
+            try (LocalVar key = localVars.register(methodParameters[0])) {
+              try (LocalVar value = localVars.register(methodParameters[1])) {
+                try (LocalVar recordConsumerVar = localVars.register(RecordConsumer.class)) {
+                  add(Codegen.storeRecordConsumer(recordConsumerVar));
+                  add(
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.startGroup)
+                  );
+                  add(writeFromVar(field.mapKey(), key, recordConsumerVar));
+                  add(writeFromVar(field.mapValue(), value, recordConsumerVar));
+                  add(
+                      recordConsumerVar.load(),
+                      Codegen.invokeMethod(Reflection.RecordConsumer.endGroup)
+                  );
+                  add(Codegen.returnVoid());
+                }
+              }
+            }
+          }
+        }
+
+        Implementation writeFromVar(Field field, LocalVar val, LocalVar recordConsumer) {
+          if (field.isEnum()) {
+            return new EnumFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isProtoMessage()) {
+            return new MessageFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isString()) {
+            return new StringFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isBinary()) {
+            return new BinaryFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isProtoWrapper()) {
+            return new ProtoWrapperFieldWriter(field, recordConsumer).writeFromVar(val);
+          } else if (field.isPrimitive()) {
+            return new PrimitiveFieldWriter(field, recordConsumer).writeFromVar(val);
+          }
+          throw new CodeGenException("field: " + field);
+        }
+      }
+
+
+      static class CodeGenElement {
         private final int id;
         private final Field field;
 
@@ -2047,7 +2172,7 @@ class ByteBuddyCodeGen {
         }
       }
 
-      static class CodeGenMessageWriter extends CodeGenElement {
+      class CodeGenMessageWriter extends CodeGenElement {
         private final Class<? extends MessageOrBuilder> messageOrBuilderInterface;
 
         public CodeGenMessageWriter(int id, Field field) {
@@ -2063,18 +2188,18 @@ class ByteBuddyCodeGen {
           return messageOrBuilderInterface;
         }
 
-        public MethodDescription.Token getMethodDescriptionToken() {
-          return new MethodDescription.Token(
+        public MethodDescription getMethodDescription() {
+          return new MethodDescription.Latent(classBuilder.toTypeDescription(), new MethodDescription.Token(
               getMethodName(),
               Visibility.PUBLIC.getMask(),
               TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(void.class),
               Collections.singletonList(
                   TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(getMethodParameterType())
-              ));
+              )));
         }
       }
 
-      static class CodeGenEnum extends CodeGenElement {
+      class CodeGenEnum extends CodeGenElement {
         private final String enumTypeFullName;
         private final Class<?> clazz;
 
@@ -2093,31 +2218,31 @@ class ByteBuddyCodeGen {
         }
 
         // final Map<String, Integer> enumNameNumberPairs<idx>;
-        public FieldDescription.Token enumNumberPairs() {
-          return new FieldDescription.Token(
+        public FieldDescription enumNumberPairs() {
+          return new FieldDescription.Latent(classBuilder.toTypeDescription(), new FieldDescription.Token(
               "enumNameNumberPairs$" + getId(),
               Modifier.PRIVATE | Modifier.FINAL,
-              TypeDescription.Generic.Builder.parameterizedType(Map.class, String.class, Integer.class).build());
+              TypeDescription.Generic.Builder.parameterizedType(Map.class, String.class, Integer.class).build()));
         }
 
         // final Descriptors.EnumDescriptor enumDescriptor<idx>
-        public FieldDescription.Token enumDescriptor() {
-          return new FieldDescription.Token(
+        public FieldDescription enumDescriptor() {
+          return new FieldDescription.Latent(classBuilder.toTypeDescription(), new FieldDescription.Token(
               "enumDescriptor$" + getId(),
               Modifier.PRIVATE | Modifier.FINAL,
-              new TypeDescription.Generic.OfNonGenericType.ForLoadedType(Descriptors.EnumDescriptor.class));
+              new TypeDescription.Generic.OfNonGenericType.ForLoadedType(Descriptors.EnumDescriptor.class)));
         }
 
         // final List<Descriptors.EnumValueDescriptor> enumValues<idx>
-        public FieldDescription.Token enumValues() {
-          return new FieldDescription.Token(
+        public FieldDescription enumValues() {
+          return new FieldDescription.Latent(classBuilder.toTypeDescription(), new FieldDescription.Token(
               "enumValues$" + getId(),
               Modifier.PRIVATE | Modifier.FINAL,
-              TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class));
+              TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(Descriptors.EnumValueDescriptor[].class)));
         }
       }
 
-      static class CodeGenMapWriter extends CodeGenElement {
+      class CodeGenMapWriter extends CodeGenElement {
         public CodeGenMapWriter(int id, Field field) {
           super(id, field);
         }
@@ -2126,18 +2251,33 @@ class ByteBuddyCodeGen {
           return "writeMapEntry$" + getId();
         }
 
-        public MethodDescription.Token writeMapEntry() {
-          MapReflectionType mapReflectionType = (MapReflectionType) getField().getReflectionType();
-          Class<?> keyType = (Class<?>) mapReflectionType.key();
-          Class<?> valueType = getValueType(mapReflectionType);
-          return new MethodDescription.Token(
+        public MethodDescription writeMapEntry() {
+          Class<?>[] parameters = writeMapEntryParameters();
+          return new MethodDescription.Latent(classBuilder.toTypeDescription(), new MethodDescription.Token(
               getMethodName(),
               Visibility.PUBLIC.getMask(),
               TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(void.class),
               Arrays.asList(
-                  TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(keyType),
-                  TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(valueType)
-              ));
+                  TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(parameters[0]),
+                  TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(parameters[1])
+              )));
+        }
+
+        public Class<?>[] writeMapEntryParameters() {
+          MapReflectionType mapReflectionType = (MapReflectionType) getField().getReflectionType();
+          Class<?> keyType = (Class<?>) mapReflectionType.key();
+          Class<?> valueType = getValueType(mapReflectionType);
+          return new Class[]{keyType, valueType};
+        }
+
+        public String getter() {
+          MapReflectionType mapReflectionType = (MapReflectionType) getField().getReflectionType();
+          boolean isEnumAndSupportsUnknownValues = false;
+          if (mapReflectionType.value() instanceof EnumReflectionType) {
+            EnumReflectionType enumReflectionType = (EnumReflectionType) mapReflectionType.value();
+            isEnumAndSupportsUnknownValues = enumReflectionType.enumSupportsUnknownValues && enumReflectionType.fieldSupportsUnknownValues;
+          }
+          return "get{}" + (isEnumAndSupportsUnknownValues ? "Value" : "") + "Map";
         }
 
         private Class<?> getValueType(MapReflectionType mapReflectionType) {
@@ -2156,21 +2296,22 @@ class ByteBuddyCodeGen {
         }
       }
 
-      static class CodeGenProtoReflectionMessageWriter extends CodeGenElement {
+      class CodeGenFieldWriterFallback extends CodeGenElement {
 
-        public CodeGenProtoReflectionMessageWriter(int id, Field field) {
+        public CodeGenFieldWriterFallback(int id, Field field) {
           super(id, field);
         }
 
-        public FieldDescription.Token protoReflectionMessageWriter() {
-          return new FieldDescription.Token(
+        public FieldDescription fieldWriter() {
+          return new FieldDescription.Latent(classBuilder.toTypeDescription(), new FieldDescription.Token(
               getFieldName(),
               Modifier.PRIVATE,
-              TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(ProtoWriteSupport.MessageWriter.class));
+              // TODO: create more specific FieldWriter
+              TypeDescription.Generic.OfNonGenericType.ForLoadedType.of(ProtoWriteSupport.FieldWriter.class)));
         }
 
         public String getFieldName() {
-          return "protoReflectionMessageWriter$" + getId();
+          return "fieldWriter$" + getId();
         }
       }
 
@@ -2179,18 +2320,18 @@ class ByteBuddyCodeGen {
         private final Class<? extends Message> protoMessage;
         private final Descriptors.Descriptor messageType;
         private final Map<Object, Method> codeGenMessageWriters;
-        private final Map<Object, Integer> protoReflectionMessageWriters;
+        private final Map<Object, Integer> fallbackFieldWriters;
 
         public GeneratedElementsInfo(FieldScanner fieldScanner,
                                      Class<? extends Message> protoMessage,
                                      Descriptors.Descriptor messageType,
                                      Map<Object, Method> codeGenMessageWriters,
-                                     Map<Object, Integer> protoReflectionMessageWriters) {
+                                     Map<Object, Integer> fallbackFieldWriters) {
           this.fieldScanner = fieldScanner;
           this.messageType = messageType;
           this.protoMessage = protoMessage;
           this.codeGenMessageWriters = codeGenMessageWriters;
-          this.protoReflectionMessageWriters = protoReflectionMessageWriters;
+          this.fallbackFieldWriters = fallbackFieldWriters;
         }
 
         public void scan(ProtoWriteSupport<?>.MessageWriter messageWriter, FieldVisitor fieldVisitor) {
@@ -2211,7 +2352,7 @@ class ByteBuddyCodeGen {
           );
         }
 
-        for (Map.Entry<Object, CodeGenProtoReflectionMessageWriter> key2CodeGenProtoReflectionMessageWriterEntry : this.protoReflectionMessageWriters.entrySet()) {
+        for (Map.Entry<Object, CodeGenFieldWriterFallback> key2CodeGenProtoReflectionMessageWriterEntry : this.fieldWriterFallbacks.entrySet()) {
           protoReflectionMessageWriters.put(
               key2CodeGenProtoReflectionMessageWriterEntry.getKey(),
               key2CodeGenProtoReflectionMessageWriterEntry.getValue().getId()
@@ -2221,9 +2362,9 @@ class ByteBuddyCodeGen {
         return new GeneratedElementsInfo(fieldScanner, protoMessage, descriptor, codeGenMessageWriters, protoReflectionMessageWriters);
       }
 
-      private static <V> void addCodeGenElement(Object key, Field field, Map<Object, V> registry,
+      private static <V> void addCodeGenElement(Field field, Map<Object, V> registry,
                                                 BiFunction<Integer, Field, V> codeElementConstructor) {
-        registry.computeIfAbsent(key, unused -> codeElementConstructor.apply(registry.size(), field));
+        registry.computeIfAbsent(field.getCodeGenerationElementKey(), unused -> codeElementConstructor.apply(registry.size(), field));
       }
 
       public Consumer<ProtoWriteSupport<?>.MessageWriter> getPatcher() {
@@ -2260,37 +2401,36 @@ class ByteBuddyCodeGen {
       public ByteBuddyMessageWriters(ProtoWriteSupport<?>.MessageWriter rootMessageWriter,
                                      ByteBuddyMessageWritersCodeGen.GeneratedElementsInfo generatedElementsInfo) {
         this.protoWriteSupport = rootMessageWriter.getProtoWriteSupport();
-        final ProtoWriteSupport<?>.MessageWriter[] protoReflectionMessageWriters = new ProtoWriteSupport<?>.MessageWriter[generatedElementsInfo.protoReflectionMessageWriters.size()];
+        final ProtoWriteSupport<?>.FieldWriter[] fallbackFieldWriters = new ProtoWriteSupport<?>.FieldWriter[generatedElementsInfo.fallbackFieldWriters.size()];
 
         // assign alternative message writers and collect protobuf reflection message writers
         generatedElementsInfo.scan(rootMessageWriter, new FieldVisitor() {
           @Override
           public void visitField(Field field) {
-            if (field.isMessage()) {
+            if (field.isFieldWriterFallback()) {
               Object key = field.getCodeGenerationElementKey();
-              if (field.isProtoReflectionMessage()) {
-                Method method = generatedElementsInfo.codeGenMessageWriters.get(key);
-                field.getMessageWriter().setAlternativeMessageWriter(getFastMessageWriter(method));
-              } else {
-                int id = generatedElementsInfo.protoReflectionMessageWriters.get(key);
-                if (protoReflectionMessageWriters[id] == null) {
-                  protoReflectionMessageWriters[id] = field.getMessageWriter();
-                }
+              int id = generatedElementsInfo.fallbackFieldWriters.get(key);
+              if (fallbackFieldWriters[id] == null) {
+                fallbackFieldWriters[id] = field.fieldWriter;
               }
+            } else if (field.isMessage()) {
+              Object key = field.getCodeGenerationElementKey();
+              Method method = generatedElementsInfo.codeGenMessageWriters.get(key);
+              field.getMessageWriter().setAlternativeMessageWriter(getFastMessageWriter(method));
             }
           }
         });
 
-        for (ProtoWriteSupport<?>.MessageWriter messageWriter : protoReflectionMessageWriters) {
-          if (messageWriter == null) {
+        for (ProtoWriteSupport<?>.FieldWriter fieldWriter : fallbackFieldWriters) {
+          if (fieldWriter == null) {
             throw new CodeGenException();
           }
         }
-        setProtoReflectionMessageWriters(protoReflectionMessageWriters);
+        setFallbackFieldWriters(fallbackFieldWriters);
       }
 
       // the implementation needs to assign the passed array to fields
-      public void setProtoReflectionMessageWriters(ProtoWriteSupport<?>.MessageWriter[] messageWriters) {
+      public void setFallbackFieldWriters(ProtoWriteSupport<?>.FieldWriter[] fieldWriters) {
       }
 
       // used from the generated methods to load record consumer in a local variable
