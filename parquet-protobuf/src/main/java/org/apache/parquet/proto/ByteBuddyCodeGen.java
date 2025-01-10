@@ -794,6 +794,11 @@ class ByteBuddyCodeGen {
 
       private Type reflectionType;
       private Object codeGenerationBasicType;
+      private Object codeGenerationKey;
+
+      private List<Field> children;
+      private Field mapKey;
+      private Field mapValue;
 
       private Field(FieldScanner fieldScanner, Field parent, ProtoWriteSupport<?>.FieldWriter fieldWriter,
                     Descriptors.FieldDescriptor fieldDescriptor, String parquetFieldName, int parquetFieldIndex) {
@@ -906,15 +911,24 @@ class ByteBuddyCodeGen {
 
       // helps codegen to identify unique methods and supporting fields to write messages, map entries and enums
       public Object getCodeGenerationElementKey() {
-        if (isMessage() || (isMap() && getChildren().get(1).isMessage())) {
-          Field parent = getParent();
-          if (parent == null) {
-            return getCodeGenerationBasicType();
-          } else {
-            return Arrays.asList(getCodeGenerationBasicType(), parent.getCodeGenerationElementKey());
-          }
+        if (codeGenerationKey == null) {
+          codeGenerationKey = initCodeGenerationKey();
         }
-        if (isBinaryMessage() || (isMap() && getChildren().get(1).isBinaryMessage())) {
+        return codeGenerationKey;
+      }
+
+      private Object initCodeGenerationKey() {
+        if (isMessage() || (isMap() && mapValue().isMessage())) {
+          List<Object> key = new ArrayList<>();
+          key.add(getCodeGenerationBasicType());
+          for (Field child : getChildren()) {
+            if (child.isProtoMessage() || (child.isMap() && child.mapValue().isProtoMessage())) {
+              key.add(child.getCodeGenerationElementKey());
+            }
+          }
+          return key;
+        }
+        if (isBinaryMessage() || (isMap() && mapValue().isBinaryMessage())) {
           return getCodeGenerationBasicType();
         }
         if (isMap()) {
@@ -953,6 +967,13 @@ class ByteBuddyCodeGen {
       }
 
       public List<Field> getChildren() {
+        if (children == null) {
+          children = initChildren();
+        }
+        return children;
+      }
+
+      private List<Field> initChildren() {
         if (isMessage()) {
           ProtoWriteSupport<?>.FieldWriter[] fieldWriters = getMessageWriter().fieldWriters;
           return resolveChildFields(fieldWriters);
@@ -1029,6 +1050,13 @@ class ByteBuddyCodeGen {
       }
 
       private Field mapKey() {
+        if (mapKey == null) {
+          mapKey = initMapKey();
+        }
+        return mapKey;
+      }
+
+      private Field initMapKey() {
         if (!isMap()) {
           throw new CodeGenException();
         }
@@ -1042,6 +1070,13 @@ class ByteBuddyCodeGen {
       }
 
       private Field mapValue() {
+        if (mapValue == null) {
+          mapValue = initMapValue();
+        }
+        return mapValue;
+      }
+
+      private Field initMapValue() {
         if (!isMap()) {
           throw new CodeGenException();
         }
