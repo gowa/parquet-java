@@ -87,7 +87,9 @@ class ByteBuddyCodeGen {
   private static final AtomicLong BYTE_BUDDY_CLASS_SEQUENCE = new AtomicLong();
 
   private static final Optional<Class<?>> com_google_protobuf_GeneratedMessageV3 = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessageV3");
+  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessageV3_ExtendableMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessageV3$ExtendableMessage");
   private static final Optional<Class<?>> com_google_protobuf_GeneratedMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessage");
+  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessage_ExtendableMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessage$ExtendableMessage");
 
   static class CodeGenException extends RuntimeException {
     public CodeGenException() {
@@ -151,7 +153,6 @@ class ByteBuddyCodeGen {
 
         private RecordConsumerMethods() {}
       }
-
 
       //TODO: rename
       static class ByteBuddyProto3FastMessageWriterMethods {
@@ -754,7 +755,7 @@ class ByteBuddyCodeGen {
           rootSchema,
           protoMessage,
           rootMessageWriter.getProtoWriteSupport().isWriteSpecsCompliant(),
-          isProtoReflectionForProto2(configuration)
+          isProtoReflectionForExtendable(configuration)
       );
 
       try {
@@ -795,7 +796,7 @@ class ByteBuddyCodeGen {
       return true;
     }
 
-    static boolean isProtoReflectionForProto2(ParquetConfiguration configuration) {
+    static boolean isProtoReflectionForExtendable(ParquetConfiguration configuration) {
       return true;
     }
 
@@ -1051,16 +1052,20 @@ class ByteBuddyCodeGen {
       private boolean isFieldWriterFallback() {
         if (isBinaryMessage())
           return true;
-        if (isMessage() && fieldScanner.isFieldWriterFallbackForProto2() && isProto2Message())
+        if (isMessage() && fieldScanner.isFieldWriterFallbackForExtendable() && isExtendableMessage())
           return true;
         return false;
       }
 
-      private boolean isProto2Message() {
+      private boolean isExtendableMessage() {
         if (!isMessage()) {
           throw new CodeGenException();
         }
-        return messageType.getFile().getSyntax() == Descriptors.FileDescriptor.Syntax.PROTO2;
+        Class<? extends Message> protoMessage = (Class<? extends Message>) getReflectionType();
+        return (com_google_protobuf_GeneratedMessage_ExtendableMessage.isPresent()
+            && com_google_protobuf_GeneratedMessage_ExtendableMessage.get().isAssignableFrom(protoMessage))
+            || (com_google_protobuf_GeneratedMessageV3_ExtendableMessage.isPresent()
+            && com_google_protobuf_GeneratedMessageV3_ExtendableMessage.get().isAssignableFrom(protoMessage));
       }
 
       public boolean isMap() {
@@ -1247,14 +1252,14 @@ class ByteBuddyCodeGen {
     }
 
     static class FieldScanner {
-      private final boolean fieldWriterFallbackForProto2;
+      private final boolean fieldWriterFallbackForExtendable;
 
-      private FieldScanner(boolean fieldWriterFallbackForProto2) {
-        this.fieldWriterFallbackForProto2 = fieldWriterFallbackForProto2;
+      private FieldScanner(boolean fieldWriterFallbackForExtendable) {
+        this.fieldWriterFallbackForExtendable = fieldWriterFallbackForExtendable;
       }
 
-      public boolean isFieldWriterFallbackForProto2() {
-        return fieldWriterFallbackForProto2;
+      public boolean isFieldWriterFallbackForExtendable() {
+        return fieldWriterFallbackForExtendable;
       }
 
       public void scan(ProtoWriteSupport<?>.MessageWriter messageWriter, Class<? extends Message> protoMessage,
@@ -1293,7 +1298,7 @@ class ByteBuddyCodeGen {
                                             Descriptors.Descriptor descriptor,
                                             ParquetConfiguration configuration) {
         this.protoWriteSupport = messageWriter.getProtoWriteSupport();
-        this.fieldScanner = new FieldScanner(isProtoReflectionForProto2(configuration));
+        this.fieldScanner = new FieldScanner(isProtoReflectionForExtendable(configuration));
         this.protoMessage = protoMessage;
         this.descriptor = descriptor;
 
@@ -1336,6 +1341,9 @@ class ByteBuddyCodeGen {
       }
 
       private void overrideSetFallbackFieldWriters() {
+        if (fieldWriterFallbacks.isEmpty()) {
+          return;
+        }
         classBuilder = classBuilder.method(ElementMatchers.named("setFallbackFieldWriters")).intercept(new Implementations() {{
           CodeGenUtils.LocalVars localVars = new CodeGenUtils.LocalVars();
           try (LocalVar thisLocalVar = localVars.register(classBuilder.toTypeDescription())) {
