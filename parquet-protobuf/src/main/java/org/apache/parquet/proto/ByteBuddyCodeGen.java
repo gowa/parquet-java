@@ -1014,7 +1014,7 @@ class ByteBuddyCodeGen {
         return (ProtoWriteSupport<?>.MessageWriter) fieldWriter;
       }
 
-      public boolean isFieldWriterFallback() {
+      public boolean isFieldWriterFallbackTransition() {
         // track only those 'protobuf reflection writers that are children of codegen writers'
         Field parent = getParent();
         while (parent != null) {
@@ -1024,12 +1024,13 @@ class ByteBuddyCodeGen {
           parent = parent.getParent();
         }
 
-        return parent != null
-            && !parent.isFieldWriterFallback()
-            && isFieldWriterFallback0();
+        return (parent != null
+            && !parent.isFieldWriterFallbackTransition()
+            && isFieldWriterFallback())
+            || (parent == null && isFieldWriterFallback());
       }
 
-      private boolean isFieldWriterFallback0() {
+      private boolean isFieldWriterFallback() {
         if (isBinaryMessage())
           return true;
         if (isMessage() && fieldScanner.isFieldWriterFallbackForProto2() && isProto2Message())
@@ -1280,6 +1281,11 @@ class ByteBuddyCodeGen {
 
         collectCodeGenElements(messageWriter, protoMessage, descriptor);
 
+        if (mapWriters.isEmpty() && codeGenMessageWriters.isEmpty()) {
+          byteBuddyMessageWritersClass = null;
+          return;
+        }
+
         classBuilder = new ByteBuddy()
                 .subclass(ByteBuddyMessageWriters.class)
                 .name(ByteBuddyMessageWriters.class.getName() + "$Generated$"
@@ -1362,7 +1368,9 @@ class ByteBuddyCodeGen {
           @Override
           public void visitField(Field field) {
             if (field.isFieldWriterFallback()) {
-              addCodeGenElement(field, fieldWriterFallbacks, CodeGenFieldWriterFallback::new);
+              if (field.isFieldWriterFallbackTransition()) {
+                addCodeGenElement(field, fieldWriterFallbacks, CodeGenFieldWriterFallback::new);
+              }
             } else if (field.isMessage()) {
               addCodeGenElement(field, codeGenMessageWriters, CodeGenMessageWriter::new);
             } else if (field.isMap()) {
@@ -1657,7 +1665,7 @@ class ByteBuddyCodeGen {
 
           @Override
           void convertRawValueAndWrite() {
-            if (!field.isFieldWriterFallback()) {
+            if (!field.isFieldWriterFallbackTransition()) {
               CodeGenMessageWriter codeGenMessageWriter = codeGenMessageWriters.get(field.getCodeGenerationElementKey());
               if (codeGenMessageWriter == null) {
                 throw new CodeGenException("field: " + field);
@@ -1682,7 +1690,7 @@ class ByteBuddyCodeGen {
 
           @Override
           void beforeLoadValueOnStack() {
-            if (!field.isFieldWriterFallback()) {
+            if (!field.isFieldWriterFallbackTransition()) {
               startGroup();
               add(MethodVariableAccess.loadThis());
             } else {
@@ -1702,7 +1710,7 @@ class ByteBuddyCodeGen {
 
           @Override
           void afterConvertRawValue() {
-            if (!field.isFieldWriterFallback()) {
+            if (!field.isFieldWriterFallbackTransition()) {
               endGroup();
             }
           }
@@ -1720,7 +1728,7 @@ class ByteBuddyCodeGen {
           Implementation writeMessageFieldsInternal(
               LocalVar proto3MessageOrBuilder) {
 
-            if (!field.isFieldWriterFallback()) {
+            if (!field.isFieldWriterFallbackTransition()) {
               for (Field child : field.getChildren()) {
                 if (child.isProtoMessage()) {
                   add(writeMessageField(proto3MessageOrBuilder, recordConsumerVar, child));
@@ -2443,10 +2451,12 @@ class ByteBuddyCodeGen {
           @Override
           public void visitField(Field field) {
             if (field.isFieldWriterFallback()) {
-              Object key = field.getCodeGenerationElementKey();
-              int id = generatedElementsInfo.fallbackFieldWriters.get(key);
-              if (fallbackFieldWriters[id] == null) {
-                fallbackFieldWriters[id] = field.fieldWriter;
+              if (field.isFieldWriterFallbackTransition()) {
+                Object key = field.getCodeGenerationElementKey();
+                int id = generatedElementsInfo.fallbackFieldWriters.get(key);
+                if (fallbackFieldWriters[id] == null) {
+                  fallbackFieldWriters[id] = field.fieldWriter;
+                }
               }
             } else if (field.isMessage()) {
               Object key = field.getCodeGenerationElementKey();
