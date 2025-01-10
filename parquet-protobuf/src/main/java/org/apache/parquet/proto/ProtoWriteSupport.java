@@ -168,7 +168,8 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
 
     this.messageWriter = new MessageWriter(descriptor, rootSchema);
 
-    ByteBuddyCodeGen.WriteSupport.tryApplyAlternativeMessageFieldsWriters(messageWriter, rootSchema, protoMessage, descriptor, configuration);
+    ByteBuddyCodeGen.WriteSupport.tryApplyAlternativeMessageFieldsWriters(
+        messageWriter, rootSchema, protoMessage, descriptor, configuration);
 
     extraMetaData.put(ProtoReadSupport.PB_DESCRIPTOR, descriptor.toProto().toString());
     extraMetaData.put(PB_SPECS_COMPLIANT_WRITE, String.valueOf(writeSpecsCompliant));
@@ -689,9 +690,9 @@ public class ProtoWriteSupport<T extends MessageOrBuilder> extends WriteSupport<
           ? (ByteString) value
           // TODO: figure out a way to use MessageOrBuilder
           : value instanceof Message
-          ? ((Message) value).toByteString()
-          // Worst-case, just dump as plain java string.
-          : ByteString.copyFromUtf8(value.toString());
+              ? ((Message) value).toByteString()
+              // Worst-case, just dump as plain java string.
+              : ByteString.copyFromUtf8(value.toString());
       Binary binary = Binary.fromConstantByteArray(byteString.toByteArray());
       recordConsumer.addBinary(binary);
     }
