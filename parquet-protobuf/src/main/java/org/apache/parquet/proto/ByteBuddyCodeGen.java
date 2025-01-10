@@ -26,6 +26,7 @@ import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
 import io.netty.handler.codec.CodecException;
+import java.lang.Enum;
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -231,14 +232,6 @@ class ByteBuddyCodeGen {
             return Size.ZERO;
           }
         };
-      }
-
-      private static Implementation returnTrue() {
-        return FixedValue.value(true);
-      }
-
-      private static Implementation returnFalse() {
-        return FixedValue.value(false);
       }
 
       private static Implementation returnVoid() {
