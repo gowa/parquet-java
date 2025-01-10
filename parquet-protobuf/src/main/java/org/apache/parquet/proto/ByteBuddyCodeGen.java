@@ -38,8 +38,6 @@ import com.google.protobuf.UInt64Value;
 import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
-import io.netty.handler.codec.CodecException;
-import java.lang.Enum;
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -50,7 +48,17 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -86,7 +94,6 @@ import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaConstant;
-import org.apache.parquet.conf.ParquetConfiguration;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.io.api.RecordConsumer;
 import org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Codegen;
@@ -120,6 +127,18 @@ class ByteBuddyCodeGen {
     }
   }
 
+  static boolean isGeneratedMessage(Class<?> protoMessage) {
+    return protoMessage != null
+        && (GeneratedMessage.isGeneratedMessage(protoMessage)
+            || GeneratedMessageV3.isGeneratedMessage(protoMessage));
+  }
+
+  static boolean isExtendableMessage(Class<?> protoMessage) {
+    return protoMessage != null
+        && (GeneratedMessage.isExtendableMessage(protoMessage)
+            || GeneratedMessageV3.isExtendableMessage(protoMessage));
+  }
+
   static class GenerateMessageClasses {
     private final Class<?> classGeneratedMessage;
     private final Class<?> classExtendableMessage;
@@ -149,8 +168,16 @@ class ByteBuddyCodeGen {
     }
   }
 
-  static boolean isByteBuddyAvailable() {
-    return ReflectionUtil.classForName("net.bytebuddy.ByteBuddy").isPresent();
+  static boolean isByteBuddyAvailable(boolean failIfNot) {
+    try {
+      Class.forName("net.bytebuddy.ByteBuddy", false, ByteBuddyCodeGen.class.getClassLoader());
+      return true;
+    } catch (ClassNotFoundException e) {
+      if (failIfNot) {
+        throw new IllegalStateException("ByteBuddy is not available", e);
+      }
+      return false;
+    }
   }
 
   static class CodeGenUtils {
@@ -618,7 +645,7 @@ class ByteBuddyCodeGen {
         Class<? extends Message> messageClass) {
       return Stream.of(messageClass)
           .filter(Objects::nonNull)
-          .filter(x -> GeneratedMessage.isGeneratedMessage(x) || GeneratedMessageV3.isGeneratedMessage(x))
+          .filter(ByteBuddyCodeGen::isGeneratedMessage)
           .flatMap(x -> Arrays.stream(x.getInterfaces()))
           .filter(MessageOrBuilder.class::isAssignableFrom)
           .map(x -> (Class<? extends MessageOrBuilder>) x)
@@ -688,7 +715,7 @@ class ByteBuddyCodeGen {
       try {
         return clazz.getConstructor(parameterTypes);
       } catch (NoSuchMethodException e) {
-        throw new CodecException(e);
+        throw new CodeGenException(e);
       }
     }
 
@@ -701,7 +728,7 @@ class ByteBuddyCodeGen {
         if (e.getCause() instanceof CodeGenException) {
           throw (CodeGenException) e.getCause();
         }
-        throw new CodecException(e.getCause());
+        throw new CodeGenException(e.getCause());
       }
     }
 
@@ -779,12 +806,9 @@ class ByteBuddyCodeGen {
         MessageType rootSchema,
         Class<? extends Message> protoMessage,
         Descriptors.Descriptor descriptor,
-        ParquetConfiguration configuration) {
-      if (protoMessage == null
-          || !(GeneratedMessage.isGeneratedMessage(protoMessage)
-              || GeneratedMessageV3.isGeneratedMessage(protoMessage))
-          || !isByteBuddyAvailable()
-          || !isByteBuddyCodeGenEnabled(configuration)) {
+        ProtoWriteSupport.CodegenMode codegenMode) {
+
+      if (!codegenMode.tryCodeGen(protoMessage)) {
         return;
       }
 
@@ -792,16 +816,16 @@ class ByteBuddyCodeGen {
           rootSchema,
           protoMessage,
           rootMessageWriter.getProtoWriteSupport().isWriteSpecsCompliant(),
-          isProtoReflectionForExtendable(configuration));
+          codegenMode.protobufReflectionForExtensions());
 
       try {
         Consumer<ProtoWriteSupport<?>.MessageWriter> messageFieldsWriterPatcher = WRITERS_CACHE.computeIfAbsent(
             cacheKey,
             unused -> createMessageFieldsWriterPatcher(
-                rootMessageWriter, protoMessage, descriptor, configuration));
+                rootMessageWriter, protoMessage, descriptor, codegenMode));
         messageFieldsWriterPatcher.accept(rootMessageWriter);
       } catch (Throwable t) {
-        if (isForceByteBuddyCodeGen(configuration)) {
+        if (!codegenMode.ignoreCodeGenException()) {
           throw t;
         }
         REVERT_WRITER_PATCHER.accept(rootMessageWriter);
@@ -812,21 +836,9 @@ class ByteBuddyCodeGen {
         ProtoWriteSupport<?>.MessageWriter rootMessageWriter,
         Class<? extends Message> protoMessage,
         Descriptors.Descriptor descriptor,
-        ParquetConfiguration configuration) {
-      return new ByteBuddyMessageWritersCodeGen(rootMessageWriter, protoMessage, descriptor, configuration)
+        ProtoWriteSupport.CodegenMode codegenMode) {
+      return new ByteBuddyMessageWritersCodeGen(rootMessageWriter, protoMessage, descriptor, codegenMode)
           .getPatcher();
-    }
-
-    static boolean isForceByteBuddyCodeGen(ParquetConfiguration configuration) {
-      return true;
-    }
-
-    static boolean isByteBuddyCodeGenEnabled(ParquetConfiguration configuration) {
-      return true;
-    }
-
-    static boolean isProtoReflectionForExtendable(ParquetConfiguration configuration) {
-      return true;
     }
 
     static class Field {
@@ -1107,8 +1119,7 @@ class ByteBuddyCodeGen {
           throw new CodeGenException();
         }
         Class<? extends Message> protoMessage = (Class<? extends Message>) getReflectionType();
-        return GeneratedMessage.isExtendableMessage(protoMessage)
-            || GeneratedMessageV3.isExtendableMessage(protoMessage);
+        return ByteBuddyCodeGen.isExtendableMessage(protoMessage);
       }
 
       public boolean isMap() {
@@ -1360,9 +1371,9 @@ class ByteBuddyCodeGen {
           ProtoWriteSupport<?>.MessageWriter messageWriter,
           Class<? extends Message> protoMessage,
           Descriptors.Descriptor descriptor,
-          ParquetConfiguration configuration) {
+          ProtoWriteSupport.CodegenMode codegenMode) {
         this.protoWriteSupport = messageWriter.getProtoWriteSupport();
-        this.fieldScanner = new FieldScanner(isProtoReflectionForExtendable(configuration));
+        this.fieldScanner = new FieldScanner(codegenMode.protobufReflectionForExtensions());
         this.protoMessage = protoMessage;
         this.descriptor = descriptor;
 
@@ -1386,11 +1397,11 @@ class ByteBuddyCodeGen {
 
         DynamicType.Unloaded<ByteBuddyMessageWriters> unloaded = classBuilder.make();
 
-        // use to debug codegen
-        try {
-          unloaded.saveIn(new java.io.File("generated_debug"));
-        } catch (Exception e) {
-        }
+        //         use to debug codegen
+        //         try {
+        //           unloaded.saveIn(new java.io.File("generated_debug"));
+        //         } catch (Exception e) {
+        //         }
 
         byteBuddyMessageWritersClass = unloaded.load(
                 null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
