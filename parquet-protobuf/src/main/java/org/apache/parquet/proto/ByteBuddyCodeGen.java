@@ -21,7 +21,20 @@ package org.apache.parquet.proto;
 import static org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Reflection;
 
 import com.google.common.collect.MapMaker;
-import com.google.protobuf.*;
+import com.google.protobuf.BoolValue;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.BytesValue;
+import com.google.protobuf.Descriptors;
+import com.google.protobuf.DoubleValue;
+import com.google.protobuf.FloatValue;
+import com.google.protobuf.Int32Value;
+import com.google.protobuf.Int64Value;
+import com.google.protobuf.Message;
+import com.google.protobuf.MessageOrBuilder;
+import com.google.protobuf.StringValue;
+import com.google.protobuf.Timestamp;
+import com.google.protobuf.UInt32Value;
+import com.google.protobuf.UInt64Value;
 import com.google.protobuf.util.Timestamps;
 import com.google.type.Date;
 import com.google.type.TimeOfDay;
@@ -51,7 +64,6 @@ import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.dynamic.scaffold.InstrumentedType;
-import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.Implementation;
 import net.bytebuddy.implementation.SuperMethodCall;
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender;
@@ -733,17 +745,17 @@ class ByteBuddyCodeGen {
       private final MessageType rootSchema;
       private final Class<? extends Message> protoMessage;
       private final boolean writeSpecsCompliant;
-      private final boolean protoReflectionForProto2;
+      private final boolean protoReflectionForExtendable;
 
       MessageFieldsWritersCacheKey(
           MessageType rootSchema,
           Class<? extends Message> protoMessage,
           boolean writeSpecsCompliant,
-          boolean protoReflectionForProto2) {
+          boolean protoReflectionForExtendable) {
         this.rootSchema = rootSchema;
         this.protoMessage = protoMessage;
         this.writeSpecsCompliant = writeSpecsCompliant;
-        this.protoReflectionForProto2 = protoReflectionForProto2;
+        this.protoReflectionForExtendable = protoReflectionForExtendable;
       }
 
       @Override
@@ -751,14 +763,14 @@ class ByteBuddyCodeGen {
         if (o == null || getClass() != o.getClass()) return false;
         MessageFieldsWritersCacheKey that = (MessageFieldsWritersCacheKey) o;
         return writeSpecsCompliant == that.writeSpecsCompliant
-            && protoReflectionForProto2 == that.protoReflectionForProto2
+            && protoReflectionForExtendable == that.protoReflectionForExtendable
             && Objects.equals(rootSchema, that.rootSchema)
             && Objects.equals(protoMessage, that.protoMessage);
       }
 
       @Override
       public int hashCode() {
-        return Objects.hash(rootSchema, protoMessage, writeSpecsCompliant, protoReflectionForProto2);
+        return Objects.hash(rootSchema, protoMessage, writeSpecsCompliant, protoReflectionForExtendable);
       }
     }
 
