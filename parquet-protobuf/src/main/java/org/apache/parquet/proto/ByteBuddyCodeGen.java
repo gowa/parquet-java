@@ -86,10 +86,8 @@ import static org.apache.parquet.proto.ByteBuddyCodeGen.CodeGenUtils.Reflection;
 class ByteBuddyCodeGen {
   private static final AtomicLong BYTE_BUDDY_CLASS_SEQUENCE = new AtomicLong();
 
-  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessageV3 = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessageV3");
-  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessageV3_ExtendableMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessageV3$ExtendableMessage");
-  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessage");
-  private static final Optional<Class<?>> com_google_protobuf_GeneratedMessage_ExtendableMessage = ReflectionUtil.classForName("com.google.protobuf.GeneratedMessage$ExtendableMessage");
+  private static final GenerateMessageClasses GeneratedMessageV3 = GenerateMessageClasses.resolve("com.google.protobuf.GeneratedMessageV3");
+  private static final GenerateMessageClasses GeneratedMessage = GenerateMessageClasses.resolve("com.google.protobuf.GeneratedMessage");
 
   static class CodeGenException extends RuntimeException {
     public CodeGenException() {
@@ -109,6 +107,34 @@ class ByteBuddyCodeGen {
     }
   }
 
+  static class GenerateMessageClasses {
+    private final Class<?> classGeneratedMessage;
+    private final Class<?> classExtendableMessage;
+
+    private GenerateMessageClasses(Class<?> classGeneratedMessage, Class<?> classExtendableMessage) {
+      this.classGeneratedMessage = classGeneratedMessage;
+      this.classExtendableMessage = classExtendableMessage;
+    }
+
+    static GenerateMessageClasses resolve(String generatedMessageClassName) {
+      Optional<Class<?>> generatedMessage = ReflectionUtil.classForName(generatedMessageClassName);
+      Optional<Class<?>> extendableMessage = ReflectionUtil.classForName(generatedMessageClassName + "$ExtendableMessage");
+      if (generatedMessage.isPresent() && extendableMessage.isPresent()) {
+        return new GenerateMessageClasses(generatedMessage.get(), extendableMessage.get());
+      } else {
+        return new GenerateMessageClasses(null, null);
+      }
+    }
+
+    public boolean isGeneratedMessage(Class<?> clazz) {
+      return classGeneratedMessage != null && clazz != null && classGeneratedMessage.isAssignableFrom(clazz);
+    }
+
+    public boolean isExtendableMessage(Class<?> clazz) {
+      return classExtendableMessage != null && clazz != null && classExtendableMessage.isAssignableFrom(clazz);
+    }
+  }
+
   static boolean isByteBuddyAvailable() {
     return ReflectionUtil.classForName("net.bytebuddy.ByteBuddy").isPresent();
   }
@@ -120,8 +146,8 @@ class ByteBuddyCodeGen {
     static class ResolvedReflection {
 
       final RecordConsumerMethods RecordConsumer = new RecordConsumerMethods();
-      final ByteBuddyProto3FastMessageWriterMethods ByteBuddyProto3FastMessageWriter =
-          new ByteBuddyProto3FastMessageWriterMethods();
+      final ByteBuddyMessageWritersMethods ByteBuddyProto3FastMessageWriter =
+          new ByteBuddyMessageWritersMethods();
       final FieldWriterMethods FieldWriter = new FieldWriterMethods();
 
       static class RecordConsumerMethods {
@@ -154,12 +180,11 @@ class ByteBuddyCodeGen {
         private RecordConsumerMethods() {}
       }
 
-      //TODO: rename
-      static class ByteBuddyProto3FastMessageWriterMethods {
+      static class ByteBuddyMessageWritersMethods {
         final Method getRecordConsumer = ReflectionUtil.getDeclaredMethod(WriteSupport.ByteBuddyMessageWriters.class, "getRecordConsumer");
         final Method enumNameNumberPairs = ReflectionUtil.getDeclaredMethod(WriteSupport.ByteBuddyMessageWriters.class, "enumNameNumberPairs", String.class);
 
-        private ByteBuddyProto3FastMessageWriterMethods() {}
+        private ByteBuddyMessageWritersMethods() {}
       }
 
       static class FieldWriterMethods {
@@ -577,10 +602,8 @@ class ByteBuddyCodeGen {
       return Stream.of(messageClass)
           .filter(Objects::nonNull)
           .filter(x ->
-              (com_google_protobuf_GeneratedMessageV3.isPresent()
-                  && com_google_protobuf_GeneratedMessageV3.get().isAssignableFrom(x))
-              || (com_google_protobuf_GeneratedMessage.isPresent()
-                  && com_google_protobuf_GeneratedMessage.get().isAssignableFrom(x))
+              GeneratedMessage.isGeneratedMessage(x)
+              || GeneratedMessageV3.isGeneratedMessage(x)
           )
           .flatMap(x -> Arrays.stream(x.getInterfaces()))
           .filter(MessageOrBuilder.class::isAssignableFrom)
@@ -746,6 +769,7 @@ class ByteBuddyCodeGen {
         ParquetConfiguration configuration
     ) {
       if (protoMessage == null
+          || !(GeneratedMessage.isGeneratedMessage(protoMessage) || GeneratedMessageV3.isGeneratedMessage(protoMessage))
           || !isByteBuddyAvailable()
           || !isByteBuddyCodeGenEnabled(configuration)) {
         return;
@@ -1062,10 +1086,8 @@ class ByteBuddyCodeGen {
           throw new CodeGenException();
         }
         Class<? extends Message> protoMessage = (Class<? extends Message>) getReflectionType();
-        return (com_google_protobuf_GeneratedMessage_ExtendableMessage.isPresent()
-            && com_google_protobuf_GeneratedMessage_ExtendableMessage.get().isAssignableFrom(protoMessage))
-            || (com_google_protobuf_GeneratedMessageV3_ExtendableMessage.isPresent()
-            && com_google_protobuf_GeneratedMessageV3_ExtendableMessage.get().isAssignableFrom(protoMessage));
+        return GeneratedMessage.isExtendableMessage(protoMessage)
+            || GeneratedMessageV3.isExtendableMessage(protoMessage);
       }
 
       public boolean isMap() {
@@ -1324,10 +1346,10 @@ class ByteBuddyCodeGen {
             .make();
 
 // use to debug codegen
-//       try {
-//         unloaded.saveIn(new java.io.File("generated_debug"));
-//       } catch (Exception e) {
-//       }
+      try {
+        unloaded.saveIn(new java.io.File("generated_debug"));
+      } catch (Exception e) {
+      }
 
         byteBuddyMessageWritersClass = unloaded
             .load(null, ClassLoadingStrategy.UsingLookup.of(MethodHandles.lookup()))
